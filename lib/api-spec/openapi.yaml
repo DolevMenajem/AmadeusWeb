@@ -1,0 +1,416 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: MIDI ML Studio API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: jobs
+    description: MIDI processing jobs
+  - name: genres
+    description: Available genres
+
+paths:
+  /upload:
+    post:
+      operationId: uploadMidiFile
+      tags: [jobs]
+      summary: Upload a MIDI file
+      description: Uploads a MIDI file and returns the stored filename to use in job submissions
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: File uploaded successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadResult"
+        "400":
+          description: Invalid file
+
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /genres:
+    get:
+      operationId: listGenres
+      tags: [genres]
+      summary: List available genres
+      description: Returns all available target genres for transformation
+      responses:
+        "200":
+          description: List of genres
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Genre"
+
+  /jobs:
+    get:
+      operationId: listJobs
+      tags: [jobs]
+      summary: List all jobs
+      description: Returns all MIDI processing jobs
+      responses:
+        "200":
+          description: List of jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Job"
+
+  /jobs/{id}:
+    get:
+      operationId: getJob
+      tags: [jobs]
+      summary: Get job by ID
+      description: Returns a single MIDI processing job
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Job found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          description: Job not found
+
+  /jobs/extend:
+    post:
+      operationId: extendMidi
+      tags: [jobs]
+      summary: Extend a MIDI file
+      description: Submits a MIDI file for AI music extension/continuation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtendInput"
+      responses:
+        "201":
+          description: Job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          description: Invalid input
+
+  /jobs/transform:
+    post:
+      operationId: transformMidi
+      tags: [jobs]
+      summary: Transform genre of a MIDI file
+      description: Submits a MIDI file for genre transformation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransformInput"
+      responses:
+        "201":
+          description: Job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          description: Invalid input
+
+  /jobs/evaluate:
+    post:
+      operationId: evaluateMidi
+      tags: [jobs]
+      summary: Evaluate a MIDI file
+      description: Submits a MIDI file for musical quality analysis and evaluation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EvaluateInput"
+      responses:
+        "201":
+          description: Job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          description: Invalid input
+
+  /jobs/live-extend:
+    post:
+      operationId: liveExtendMidi
+      tags: [jobs]
+      summary: Live music extension
+      description: Submits a real-time MIDI snippet for immediate live extension
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LiveExtendInput"
+      responses:
+        "201":
+          description: Job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          description: Invalid input
+
+  /jobs/{id}/download:
+    get:
+      operationId: downloadJobResult
+      tags: [jobs]
+      summary: Get download URL for job result
+      description: Returns a signed download URL for the output MIDI file
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Download info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadInfo"
+        "404":
+          description: Job not found or not completed
+
+  /stats:
+    get:
+      operationId: getStats
+      tags: [jobs]
+      summary: Platform statistics
+      description: Returns aggregate stats about usage and job processing
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Stats"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    Genre:
+      type: object
+      required: [id, name, description]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+
+    Job:
+      type: object
+      required: [id, type, status, inputFilename, createdAt]
+      properties:
+        id:
+          type: integer
+        type:
+          type: string
+          enum: [extend, transform, evaluate, live_extend]
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        inputFilename:
+          type: string
+        outputFilename:
+          type: ["string", "null"]
+        targetGenre:
+          type: ["string", "null"]
+        barsToExtend:
+          type: ["integer", "null"]
+        evaluationResult:
+          $ref: "#/components/schemas/EvaluationResult"
+        errorMessage:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: ["string", "null"]
+          format: date-time
+
+    MidiFeatures:
+      type: object
+      properties:
+        totalNotes:
+          type: integer
+        uniquePitches:
+          type: integer
+        estimatedTempo:
+          type: integer
+        trackCount:
+          type: integer
+        durationSeconds:
+          type: number
+
+    EvaluationResult:
+      type: object
+      properties:
+        overallScore:
+          type: number
+        rhythmScore:
+          type: number
+        harmonyScore:
+          type: number
+        melodyScore:
+          type: number
+        complexityScore:
+          type: number
+        predictedGenre:
+          type: string
+        genreConfidence:
+          type: number
+        midiFeatures:
+          $ref: "#/components/schemas/MidiFeatures"
+        lecturerFeedback:
+          type: string
+        summary:
+          type: string
+        suggestions:
+          type: array
+          items:
+            type: string
+
+    ExtendInput:
+      type: object
+      required: [inputFilename, barsToExtend]
+      properties:
+        inputFilename:
+          type: string
+        barsToExtend:
+          type: integer
+          minimum: 1
+          maximum: 64
+
+    TransformInput:
+      type: object
+      required: [inputFilename, targetGenre]
+      properties:
+        inputFilename:
+          type: string
+        targetGenre:
+          type: string
+
+    EvaluateInput:
+      type: object
+      required: [inputFilename]
+      properties:
+        inputFilename:
+          type: string
+
+    LiveExtendInput:
+      type: object
+      required: [inputFilename]
+      properties:
+        inputFilename:
+          type: string
+        barsToExtend:
+          type: integer
+          minimum: 1
+          maximum: 8
+
+    UploadResult:
+      type: object
+      required: [filename, originalName, size]
+      properties:
+        filename:
+          type: string
+        originalName:
+          type: string
+        size:
+          type: integer
+
+    DownloadInfo:
+      type: object
+      required: [jobId, filename, url]
+      properties:
+        jobId:
+          type: integer
+        filename:
+          type: string
+        url:
+          type: string
+
+    Stats:
+      type: object
+      required: [totalJobs, completedJobs, failedJobs, byType]
+      properties:
+        totalJobs:
+          type: integer
+        completedJobs:
+          type: integer
+        failedJobs:
+          type: integer
+        byType:
+          $ref: "#/components/schemas/StatsByType"
+
+    StatsByType:
+      type: object
+      required: [extend, transform, evaluate, live_extend]
+      properties:
+        extend:
+          type: integer
+        transform:
+          type: integer
+        evaluate:
+          type: integer
+        live_extend:
+          type: integer

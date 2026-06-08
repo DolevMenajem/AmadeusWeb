@@ -1,0 +1,6 @@
+{
+  "name": "@workspace/api-server",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Python/FastAPI backend — see server.py and python/ directory. This package.json exists only as a pnpm workspace marker."
+}
