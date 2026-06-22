@@ -235,14 +235,39 @@ export default function Extend() {
                     </div>
                   )}
 
-                  {job.status === "completed" && downloadInfo && (
-                    <div className="space-y-3">
-                      <MidiPlayer url={downloadInfo.url} label="Extended piece" />
-                      <Button asChild variant="outline" className="w-full gap-2" data-testid="button-download">
-                        <a href={downloadInfo.url} download={downloadInfo.filename}>
-                          <Download className="w-4 h-4" /> Download MIDI
-                        </a>
-                      </Button>
+                  {job.status === "completed" && (
+                    <div className="space-y-6 pt-4 animate-in fade-in slide-in-from-bottom-2 duration-500">
+                      
+                      {/* Audio Player for the Rendered WAV */}
+                      <div className="space-y-3 bg-secondary/30 p-4 rounded-lg border border-border/50">
+                        <h4 className="text-sm font-semibold flex items-center justify-center gap-2">
+                          <BrainCircuit className="w-5 h-5 text-primary" /> 
+                          AI Studio Render
+                        </h4>
+                        <audio 
+                          controls 
+                          className="w-full h-10 rounded-md" 
+                          src={`/api/jobs/${job.id}/download?type=audio`}
+                          controlsList="nodownload"
+                        >
+                          Your browser does not support the audio element.
+                        </audio>
+                      </div>
+
+                      {/* Dual Download Buttons */}
+                      <div className="grid grid-cols-2 gap-3">
+                        <Button asChild variant="default" className="w-full gap-2 shadow-sm">
+                          <a href={`/api/jobs/${job.id}/download?type=full`} download>
+                            <Download className="w-4 h-4" /> Full Song
+                          </a>
+                        </Button>
+                        <Button asChild variant="outline" className="w-full gap-2">
+                          <a href={`/api/jobs/${job.id}/download?type=extension`} download>
+                            <Download className="w-4 h-4" /> Extension Only
+                          </a>
+                        </Button>
+                      </div>
+                      
                     </div>
                   )}
                 </>

@@ -4,7 +4,7 @@ import random
 import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 import traceback
@@ -261,37 +261,79 @@ async def evaluate_midi(body: EvaluateInput):
     return serialize_job(row)
 
 
-# ── POST /jobs/live-extend ────────────────────────────────────────────────────
+# ── POST /api/jam (LIVE JAMMING FAST-TRACK) ───────────────────────────────────
 
-class LiveExtendInput(BaseModel):
-    inputFilename: str
-    barsToExtend: int = Field(default=4, ge=1, le=8)
+class JamNote(BaseModel):
+    pitch: int
+    time: int
+    duration: int
+    velocity: int
 
-@router.post("/jobs/live-extend", status_code=201)
-async def live_extend_midi(body: LiveExtendInput):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO jobs (type, status, input_filename, bars_to_extend) VALUES (%s, %s, %s, %s) RETURNING *",
-                ("live_extend", "pending", body.inputFilename, body.barsToExtend),
-            )
-            row = cur.fetchone()
-    asyncio.create_task(simulate_processing(row["id"], "live_extend", bars=body.barsToExtend, input_filename=body.inputFilename))
-    return serialize_job(row)
+class JamRequest(BaseModel):
+    notes: List[JamNote]
+    num_generate: int = 64  # Keep it short for fast response (1-2 bars)
+    temperature: float = 0.8
+
+@router.post("/jam", status_code=200)
+async def live_jam_endpoint(body: JamRequest):
+    """Bypasses SQLite and Disk completely. In-memory RAM to RAM processing."""
+    if not body.notes:
+        raise HTTPException(status_code=400, detail="No notes provided")
+        
+    notes_data = [n.model_dump() for n in body.notes]
+    
+    # Run in an executor thread so we don't freeze the FastAPI web server
+    loop = asyncio.get_running_loop()
+    try:
+        result_notes = await loop.run_in_executor(
+            None,
+            lambda: composer_octuple.live_extend(notes_data, body.num_generate, body.temperature)
+        )
+        return {"notes": result_notes}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── GET /jobs/:id/download ────────────────────────────────────────────────────
 
+from fastapi.responses import FileResponse
+
 @router.get("/jobs/{job_id}/download")
-def download_job_result(job_id: int):
+def download_job_result(job_id: int, type: str = "full"):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM jobs WHERE id = %s", (job_id,))
             row = cur.fetchone()
+            
     if not row or row["status"] != "completed" or not row["output_filename"]:
-        raise HTTPException(status_code=404, detail="Job not found or not completed")
-    return {
-        "jobId": row["id"],
-        "filename": row["output_filename"],
-        "url": f"/api/files/{row['output_filename']}",
-    }
+        raise HTTPException(status_code=404, detail="Job result not found")
+
+    base_name = row["output_filename"].replace(".mid", "")
+    
+    # Route the request to the correct generated file
+    if type == "extension":
+        file_name = f"{base_name}_extension.mid"
+        media_type = "audio/midi"
+        download_name = f"extension_{row['output_filename']}"
+    elif type == "audio":
+        file_name = f"{base_name}.wav"
+        media_type = "audio/wav"
+        download_name = row["output_filename"].replace(".mid", ".wav")
+    else: # full
+        file_name = f"{base_name}_full.mid"
+        media_type = "audio/midi"
+        download_name = f"full_{row['output_filename']}"
+
+    file_path = Path(UPLOADS_DIR) / file_name
+    
+    # Fallback just in case an older job only has the base .mid file
+    if not file_path.exists():
+        file_path = Path(UPLOADS_DIR) / row["output_filename"]
+        download_name = row["output_filename"]
+        media_type = "audio/midi"
+        
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found on disk")
+        
+    return FileResponse(path=file_path, filename=download_name, media_type=media_type)

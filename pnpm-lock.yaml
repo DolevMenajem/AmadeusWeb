@@ -156,6 +156,10 @@ overrides:
 importers:
 
   .:
+    dependencies:
+      soundfont-player:
+        specifier: ^0.12.0
+        version: 0.12.0
     devDependencies:
       prettier:
         specifier: ^3.8.1
@@ -1460,6 +1464,9 @@ packages:
     engines: {node: '>=0.4.0'}
     hasBin: true
 
+  adsr@1.0.1:
+    resolution: {integrity: sha512-thr9LK4jxApOzBA33IWOA83bXJFbyfbeozpHXyrMQOIhUni198uRxXqDhobW0S/51iokqty2Yz2WbLZbE6tntQ==}
+
   ajv-draft-04@1.0.0:
     resolution: {integrity: sha512-mv00Te6nmYbRp5DCwclxtt7yV/joXJPGS7nM+97GdxvuttCOfgI3K4U25zboyeX0O+myI8ERluxQe5wljMmVIw==}
     peerDependencies:
@@ -1491,6 +1498,10 @@ packages:
 
   array-flatten@3.0.0:
     resolution: {integrity: sha512-zPMVc3ZYlGLNk4mpK1NzP2wg0ml9t7fUgDsayR5Y5rSzxQilzR9FGu/EH2jQOcKSAeAfWeylyW8juy3OkWRvNA==}
+
+  audio-loader@0.5.0:
+    resolution: {integrity: sha512-mEoYRjZhqkBSen/X9i2PNosqvafEsur8bI5MNoPr0wsJu9Nzlul3Yv1elYeMPsXxTxYhXLY8AZlScBvaK4mydg==}
+    deprecated: 'Deprecated: use native fetch() + decodeAudioData() instead. See https://github.com/audiojs/audio-loader#migration'
 
   automation-events@7.1.19:
     resolution: {integrity: sha512-cD+TLhJTI0q4AI3ktd353lrGZiVa9AchowSDzQzzGjSoYe22js4vlS32VUtWuaulghi1Yq0KYNWKk9wWuGymPA==}
@@ -2016,6 +2027,9 @@ packages:
   midi-file@1.2.4:
     resolution: {integrity: sha512-B5SnBC6i2bwJIXTY9MElIydJwAmnKx+r5eJ1jknTLetzLflEl0GWveuBB6ACrQpecSRkOB6fhTx1PwXk2BVxnA==}
 
+  midimessage@1.0.5:
+    resolution: {integrity: sha512-MPJ2tDupFOfZB5/PLp8fri1IS4fd9hPj0Bio//FBhWRQ+TsJA7/49CF1aJyraDxa0Jq8zMHAwrwXl2GINvLvgw==}
+
   minimatch@9.0.9:
     resolution: {integrity: sha512-OBwBN9AL4dqmETlpS2zasx+vTeWclWzkblfZk7KTA5j3jeOONz/tRCnZomUyvNg83wL5Zv9Ss6HMJXAgL8R2Yg==}
     engines: {node: '>=16 || 14 >=14.17'}
@@ -2048,6 +2062,12 @@ packages:
 
   node-releases@2.0.36:
     resolution: {integrity: sha512-TdC8FSgHz8Mwtw9g5L4gR/Sh9XhSP/0DEkQxfEFXOpiul5IiHgHan2VhYYb6agDSfp4KuvltmGApc8HMgUrIkA==}
+
+  note-parser@1.1.0:
+    resolution: {integrity: sha512-YTqWQBsRp40EFrEznnkGtmx68gcgOQ8CdoBspqGBA3G1/4mJwIYbDe/vuNpX3oGX2DhP7b1dBgTmj7p3Zr0P1Q==}
+
+  note-parser@2.0.1:
+    resolution: {integrity: sha512-w9o6Fv46y3NsFxeezTZSmftBtUM/ypme6iZWVrTJvvsD5RN+w0XNDePWtfreNrZFL3jSjBFhadPoXb+pJO4UdA==}
 
   npm-run-path@6.0.0:
     resolution: {integrity: sha512-9qny7Z9DsQU8Ou39ERsPU4OZQlSTP47ShQzuKZ6PRXpYLtIFgl/DEBYEXKlvcEa+9tHVcK8CF81Y2V72qaZhWA==}
@@ -2303,6 +2323,9 @@ packages:
   run-parallel@1.2.0:
     resolution: {integrity: sha512-5l4VyZR86LZ/lDxZTR6jqL8AFE2S0IFLMP26AbjsLVADxHdhB/c0GUsH+y39UfCi3dzz8OlQuPmnaJOMoDHQBA==}
 
+  sample-player@0.5.5:
+    resolution: {integrity: sha512-VQ9pXPJ1m/eTH8QK6OQ8Dn/HSVToNyY9w9vnv+y/yjkJeRm87tJ/gBEm66jItfSLhKe6VG1DfX8+oT+Mg7QUpg==}
+
   scheduler@0.26.0:
     resolution: {integrity: sha512-NlHwttCI/l5gCPR3D1nNXtWABUmBwvZpEQiD4IXSbIDq8BzLIK/7Ir5gTFSGZDUu37K5cMNp0hFtzO38sC7gWA==}
 
@@ -2331,6 +2354,9 @@ packages:
     peerDependencies:
       react: ^18.0.0 || ^19.0.0 || ^19.0.0-rc
       react-dom: ^18.0.0 || ^19.0.0 || ^19.0.0-rc
+
+  soundfont-player@0.12.0:
+    resolution: {integrity: sha512-8BJIsAt7h1PK3thSZDgF6zecgGhYkK74JnZO8WRZi3h34qG6H/DYlnv7cpRvL7Q9C8N6qld4Qwj7nJsX1gYjEA==}
 
   source-map-js@1.2.1:
     resolution: {integrity: sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==}
@@ -3763,6 +3789,8 @@ snapshots:
 
   acorn@8.16.0: {}
 
+  adsr@1.0.1: {}
+
   ajv-draft-04@1.0.0(ajv@8.18.0):
     optionalDependencies:
       ajv: 8.18.0
@@ -3789,6 +3817,8 @@ snapshots:
       tslib: 2.8.1
 
   array-flatten@3.0.0: {}
+
+  audio-loader@0.5.0: {}
 
   automation-events@7.1.19:
     dependencies:
@@ -4182,6 +4212,8 @@ snapshots:
 
   midi-file@1.2.4: {}
 
+  midimessage@1.0.5: {}
+
   minimatch@9.0.9:
     dependencies:
       brace-expansion: 2.0.2
@@ -4206,6 +4238,10 @@ snapshots:
       react-dom: 19.1.0(react@19.1.0)
 
   node-releases@2.0.36: {}
+
+  note-parser@1.1.0: {}
+
+  note-parser@2.0.1: {}
 
   npm-run-path@6.0.0:
     dependencies:
@@ -4464,6 +4500,12 @@ snapshots:
     dependencies:
       queue-microtask: 1.2.3
 
+  sample-player@0.5.5:
+    dependencies:
+      adsr: 1.0.1
+      midimessage: 1.0.5
+      note-parser: 1.1.0
+
   scheduler@0.26.0: {}
 
   semver@6.3.1: {}
@@ -4482,6 +4524,12 @@ snapshots:
     dependencies:
       react: 19.1.0
       react-dom: 19.1.0(react@19.1.0)
+
+  soundfont-player@0.12.0:
+    dependencies:
+      audio-loader: 0.5.0
+      note-parser: 2.0.1
+      sample-player: 0.5.5
 
   source-map-js@1.2.1: {}
 

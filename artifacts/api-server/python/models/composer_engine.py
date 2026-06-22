@@ -106,11 +106,19 @@ class AmadeusComposerREMI:
         return seq.tolist()
 
     def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0):
+        import subprocess
+        
         template = Score(str(input_midi_path))
         combined = copy.deepcopy(template)
+        
+        # Create a blank canvas for the isolated extension
+        extension_only = copy.deepcopy(template)
+        for tr in extension_only.tracks:
+            tr.notes.clear()
 
         for i, tr in enumerate(template.tracks):
             if len(tr.notes) == 0: continue
+            
             single = copy.deepcopy(template)
             single.tracks = [tr]
             tok_seq = self.tokenizer(single)
@@ -119,8 +127,10 @@ class AmadeusComposerREMI:
             prompt = ids[-256:] 
             if not prompt: continue
             
+            # REMI does not use max_bar_window
             full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k, top_p)
             cont_ids = full_ids[len(prompt):]
+            if not cont_ids: continue
             
             new_tok_seq = TokSequence(ids=cont_ids, are_ids_encoded=True)
             if hasattr(self.tokenizer, "decode_token_ids"): self.tokenizer.decode_token_ids(new_tok_seq)
@@ -128,18 +138,45 @@ class AmadeusComposerREMI:
             
             try:
                 cont_score = self.tokenizer.decode([new_tok_seq])
+                if not cont_score.tracks: continue
+                
                 if cont_score.tpq != combined.tpq:
                     try: cont_score = cont_score.resample(tpq=combined.tpq)
                     except: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
-                    
+                
                 for n in cont_score.tracks[0].notes:
-                    if getattr(n, 'time', None) is not None and isinstance(n.time, int):
+                    t = getattr(n, 'time', None)
+                    d = getattr(n, 'duration', None)
+                    if t is not None and d is not None and isinstance(t, int) and isinstance(d, int):
                         combined.tracks[i].notes.append(n)
+                        extension_only.tracks[i].notes.append(copy.deepcopy(n))
+                
                 combined.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                extension_only.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
             except Exception as e:
                 print(f"Skipping track due to decode error: {e}")
                 
-        combined.dump_midi(output_midi_path)
+        # Shift isolated extension to 0:00
+        min_time = min((n.time for tr in extension_only.tracks for n in tr.notes), default=0)
+        for tr in extension_only.tracks:
+            for n in tr.notes: n.time -= min_time
+
+        # Save files
+        base_path_str = str(output_midi_path).replace(".mid", "")
+        full_path = f"{base_path_str}_full.mid"
+        ext_path = f"{base_path_str}_extension.mid"
+        wav_path = f"{base_path_str}.wav"
+        
+        combined.dump_midi(full_path)
+        extension_only.dump_midi(ext_path)
+        
+        # Render Audio
+        soundfont = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
+        try:
+            subprocess.run(["fluidsynth", "-ni", soundfont, full_path, "-F", wav_path, "-r", "44100"], check=True, stdout=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"FluidSynth error: {e}")
+
         return output_midi_path
 
 
@@ -255,8 +292,15 @@ class AmadeusComposerOctuple:
         return seq.tolist()
 
     def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0):
+        import subprocess 
+        
         template = Score(str(input_midi_path))
         combined = copy.deepcopy(template)
+        
+        # Create a blank canvas for the isolated extension
+        extension_only = copy.deepcopy(template)
+        for tr in extension_only.tracks:
+            tr.notes.clear()
 
         for i, tr in enumerate(template.tracks):
             if len(tr.notes) == 0: continue
@@ -274,7 +318,8 @@ class AmadeusComposerOctuple:
             prompt = ids[-256:] 
             if not prompt: continue
             
-            full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k, top_p, max_bar_window=2)
+            # Octuple uses max_bar_window (set to 100 to fix the 2:39 overwrite bug)
+            full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k, top_p, max_bar_window=100)
             cont_ids = full_ids[len(prompt):]
             if not cont_ids: continue
             
@@ -294,10 +339,90 @@ class AmadeusComposerOctuple:
                     d = getattr(n, 'duration', None)
                     if t is not None and d is not None and isinstance(t, int) and isinstance(d, int):
                         combined.tracks[i].notes.append(n)
+                        extension_only.tracks[i].notes.append(copy.deepcopy(n))
                 
                 combined.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                extension_only.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
             except Exception as e:
                 print(f"Skipping track due to decode error: {e}")
                 
-        combined.dump_midi(output_midi_path)
+        # Shift isolated extension to 0:00
+        min_time = min((n.time for tr in extension_only.tracks for n in tr.notes), default=0)
+        for tr in extension_only.tracks:
+            for n in tr.notes: n.time -= min_time
+
+        # Save files
+        base_path_str = str(output_midi_path).replace(".mid", "")
+        full_path = f"{base_path_str}_full.mid"
+        ext_path = f"{base_path_str}_extension.mid"
+        wav_path = f"{base_path_str}.wav"
+        
+        combined.dump_midi(full_path)
+        extension_only.dump_midi(ext_path)
+        
+        # Render Audio
+        soundfont = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
+        try:
+            subprocess.run(["fluidsynth", "-ni", soundfont, full_path, "-F", wav_path, "-r", "44100"], check=True, stdout=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"FluidSynth error: {e}")
+
         return output_midi_path
+
+    def live_extend(self, notes_data, num_generate=64, temperature=0.8):
+            """
+            FAST-TRACK ENGINE: Takes raw JSON notes from RAM, extends them, 
+            and returns raw JSON notes. No hard drive I/O.
+            """
+            from symusic import Score, Track, Note
+            
+            # 1. Build an in-memory MIDI score from the JSON payload
+            score = Score(480) # Standard Ticks Per Quarter Note
+            track = Track(program=0, is_drum=False, name="LiveJam")
+            
+            for nd in notes_data:
+                track.notes.append(Note(
+                    time=int(nd['time']), 
+                    duration=int(nd['duration']), 
+                    pitch=int(nd['pitch']), 
+                    velocity=int(nd['velocity'])
+                ))
+            score.tracks.append(track)
+            
+            # 2. Tokenize the memory-score
+            tok_seq = self.tokenizer(score)
+            ids = []
+            if isinstance(tok_seq, list):
+                for ts in tok_seq: ids.extend(ts.ids)
+            else:
+                ids = list(tok_seq.ids)
+                
+            prompt = ids[-256:]
+            if not prompt: return []
+            
+            # 3. Generate instantly (Small window & short generation for low latency)
+            full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k=0, top_p=1.0, max_bar_window=4)
+            cont_ids = full_ids[len(prompt):]
+            if not cont_ids: return []
+            
+            # 4. Decode back to notes
+            new_tok_seq = TokSequence(ids=[list(t) for t in cont_ids])
+            self.tokenizer.complete_sequence(new_tok_seq)
+            
+            cont_score = self.tokenizer.decode([new_tok_seq])
+            if not cont_score.tracks: return []
+            
+            # 5. Extract notes, shift time to zero, and return as JSON-ready dicts
+            response_notes = []
+            raw_notes = cont_score.tracks[0].notes
+            if len(raw_notes) > 0:
+                min_time = min(n.time for n in raw_notes)
+                for n in raw_notes:
+                    response_notes.append({
+                        "pitch": n.pitch,
+                        "time": n.time - min_time, # Shift to 0 so frontend plays immediately
+                        "duration": n.duration,
+                        "velocity": n.velocity
+                    })
+                    
+            return response_notes
