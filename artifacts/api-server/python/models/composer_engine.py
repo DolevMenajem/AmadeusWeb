@@ -5,7 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
 from miditok import REMI, Octuple, TokSequence
-from symusic import Score
+from symusic import Score, Track, Note, Tempo, TimeSignature
+import tempfile
 
 # ─── SHARED UTILITIES FOR MULTI-TRACK ────────────────────────────────────────
 
@@ -370,59 +371,69 @@ class AmadeusComposerOctuple:
         return output_midi_path
 
     def live_extend(self, notes_data, num_generate=64, temperature=0.8):
-            """
-            FAST-TRACK ENGINE: Takes raw JSON notes from RAM, extends them, 
-            and returns raw JSON notes. No hard drive I/O.
-            """
-            from symusic import Score, Track, Note
+        
+        print(f"\n--- [LIVE JAM] INCOMING REQUEST ---")
+        
+        # 1. Build the raw score with explicit Metadata
+        raw_score = Score(480) 
+        raw_score.tempos.append(Tempo(time=0, qpm=120))
+        raw_score.time_signatures.append(TimeSignature(time=0, numerator=4, denominator=4))
+        
+        track = Track(program=0, is_drum=False, name="LiveJam")
+        for nd in notes_data:
+            track.notes.append(Note(
+                time=int(nd['time']), 
+                duration=int(nd['duration']), 
+                pitch=int(nd['pitch']), 
+                velocity=int(nd['velocity'])
+            ))
             
-            # 1. Build an in-memory MIDI score from the JSON payload
-            score = Score(480) # Standard Ticks Per Quarter Note
-            track = Track(program=0, is_drum=False, name="LiveJam")
+        track.notes.sort(key=lambda n: getattr(n, 'time', 0))
+        raw_score.tracks.append(track)
+        
+        # 2. THE ROUND-TRIP TRICK: Force symusic's C++ parser to normalize the grid
+        fd, path = tempfile.mkstemp(suffix=".mid")
+        os.close(fd)
+        raw_score.dump_midi(path)
+        
+        # Read it back EXACTLY how the offline model does
+        score = Score(path)
+        os.remove(path)
+        
+        # 3. Tokenize the perfectly formatted score
+        tok_seq = self.tokenizer(score)
+        ids = []
+        if isinstance(tok_seq, list):
+            for ts in tok_seq: ids.extend(ts.ids)
+        else:
+            ids = list(tok_seq.ids)
             
-            for nd in notes_data:
-                track.notes.append(Note(
-                    time=int(nd['time']), 
-                    duration=int(nd['duration']), 
-                    pitch=int(nd['pitch']), 
-                    velocity=int(nd['velocity'])
-                ))
-            score.tracks.append(track)
-            
-            # 2. Tokenize the memory-score
-            tok_seq = self.tokenizer(score)
-            ids = []
-            if isinstance(tok_seq, list):
-                for ts in tok_seq: ids.extend(ts.ids)
-            else:
-                ids = list(tok_seq.ids)
-                
-            prompt = ids[-256:]
-            if not prompt: return []
-            
-            # 3. Generate instantly (Small window & short generation for low latency)
-            full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k=0, top_p=1.0, max_bar_window=4)
-            cont_ids = full_ids[len(prompt):]
-            if not cont_ids: return []
-            
-            # 4. Decode back to notes
-            new_tok_seq = TokSequence(ids=[list(t) for t in cont_ids])
-            self.tokenizer.complete_sequence(new_tok_seq)
-            
-            cont_score = self.tokenizer.decode([new_tok_seq])
-            if not cont_score.tracks: return []
-            
-            # 5. Extract notes, shift time to zero, and return as JSON-ready dicts
-            response_notes = []
-            raw_notes = cont_score.tracks[0].notes
-            if len(raw_notes) > 0:
-                min_time = min(n.time for n in raw_notes)
-                for n in raw_notes:
-                    response_notes.append({
-                        "pitch": n.pitch,
-                        "time": n.time - min_time, # Shift to 0 so frontend plays immediately
-                        "duration": n.duration,
-                        "velocity": n.velocity
-                    })
+        prompt = ids[-256:]
+        if not prompt: return []
+        
+        # Generate using the exact same parameters as the offline model (max_bar_window=100)
+        full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k=0, top_p=0.95, max_bar_window=100)
+        cont_ids = full_ids[len(prompt):]
+        if not cont_ids: return []
+        
+        new_tok_seq = TokSequence(ids=[list(t) for t in cont_ids])
+        self.tokenizer.complete_sequence(new_tok_seq)
+        
+        cont_score = self.tokenizer.decode([new_tok_seq])
+        if not cont_score.tracks: return []
+        
+        response_notes = []
+        raw_notes = cont_score.tracks[0].notes
+        
+        if len(raw_notes) > 0:
+            min_time = min(getattr(n, 'time', 0) for n in raw_notes)
+            for n in raw_notes:
+                n_time = getattr(n, 'time', 0)
+                response_notes.append({
+                    "pitch": getattr(n, 'pitch', 60),
+                    "time": n_time - min_time, 
+                    "duration": getattr(n, 'duration', 120),
+                    "velocity": getattr(n, 'velocity', 80)
+                })
                     
-            return response_notes
+        return response_notes

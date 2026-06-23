@@ -4,11 +4,10 @@ import { useState, useRef, useEffect } from "react";
 import Soundfont from "soundfont-player";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Music, Mic, Square, Send, Activity, Volume2 } from "lucide-react";
+import { Music, Mic, Square, Activity, Volume2, Play, User, Bot, Download } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { Slider } from "@/components/ui/slider";
 
-// Standard mapping to convert milliseconds to MIDI ticks (assuming 120 BPM)
 const MS_TO_TICKS = 0.96; 
 const TICKS_TO_MS = 1.0416;
 
@@ -19,22 +18,33 @@ interface JamNote {
   velocity: number;
 }
 
+// NEW: Chat Message Architecture
+interface ChatMessage {
+  id: string;
+  sender: "user" | "ai";
+  notes: JamNote[];
+  timestamp: Date;
+}
+
 export default function LiveExtend() {
   const { toast } = useToast();
   const [isReady, setIsReady] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isWaitingForAI, setIsWaitingForAI] = useState(false);
-  const [recordedNotes, setRecordedNotes] = useState<JamNote[]>([]);
+  
+  // State: The Conversation History & Current Buffer
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [currentRecording, setCurrentRecording] = useState<JamNote[]>([]);
   const [activeKeys, setActiveKeys] = useState<number[]>([]);
-  const [temperature, setTemperature] = useState([0.5]); // Default safe temperature
-  const [numGenerate, setNumGenerate] = useState([64]);  // Default 64 notes
+  
+  const [temperature, setTemperature] = useState([0.5]); 
+  const [numGenerate, setNumGenerate] = useState([64]);  
 
   const audioContext = useRef<AudioContext | null>(null);
   const instrument = useRef<Soundfont.Player | null>(null);
   const recordingStartTime = useRef<number>(0);
-  const activeNotesMap = useRef<Map<number, number>>(new Map()); // Maps pitch to start time
+  const activeNotesMap = useRef<Map<number, number>>(new Map()); 
 
-  // Initializes the browser's audio engine (Requires user click due to browser security)
   const initializeAudio = async () => {
     try {
       const AC = window.AudioContext || (window as any).webkitAudioContext;
@@ -47,15 +57,11 @@ export default function LiveExtend() {
     }
   };
 
-  // Note Interaction
   const playNote = (pitch: number) => {
     if (!instrument.current || !audioContext.current) return;
-    
-    // Play sound
     instrument.current.play(pitch.toString(), audioContext.current.currentTime, { duration: 2 });
     setActiveKeys((prev) => [...prev, pitch]);
 
-    // Record note start time if we are recording
     if (isRecording) {
       const startTimeMs = Date.now() - recordingStartTime.current;
       activeNotesMap.current.set(pitch, startTimeMs);
@@ -65,47 +71,54 @@ export default function LiveExtend() {
   const stopNote = (pitch: number) => {
     setActiveKeys((prev) => prev.filter((p) => p !== pitch));
     
-    // Finalize recorded note
     if (isRecording && activeNotesMap.current.has(pitch)) {
       const startTimeMs = activeNotesMap.current.get(pitch)!;
       const durationMs = (Date.now() - recordingStartTime.current) - startTimeMs;
       activeNotesMap.current.delete(pitch);
 
-      // Quantize/Convert ms to ticks for the AI
-      setRecordedNotes((prev) => [
+      setCurrentRecording((prev) => [
         ...prev,
         {
           pitch,
           time: Math.round(startTimeMs * MS_TO_TICKS),
-          duration: Math.max(Math.round(durationMs * MS_TO_TICKS), 120), // Enforce minimum duration
-          velocity: 80, // Default velocity
+          duration: Math.max(Math.round(durationMs * MS_TO_TICKS), 120), 
+          velocity: 80, 
         },
       ]);
     }
   };
 
-  // UI Controls
-  const toggleRecording = () => {
-    if (isRecording) {
-      setIsRecording(false);
-    } else {
-      setRecordedNotes([]);
-      activeNotesMap.current.clear();
-      recordingStartTime.current = Date.now();
-      setIsRecording(true);
-    }
+  // --- RECORDING & AI HANDOFF LOGIC ---
+
+  const startRecording = () => {
+    setCurrentRecording([]);
+    activeNotesMap.current.clear();
+    recordingStartTime.current = Date.now();
+    setIsRecording(true);
   };
 
-  const sendToAI = async () => {
-    if (recordedNotes.length === 0) return;
-    setIsWaitingForAI(true);
+  const stopAndSend = async () => {
+    setIsRecording(false);
+    if (currentRecording.length === 0) return;
 
+    // 1. Package User's notes into a message
+    const userMsg: ChatMessage = {
+      id: Math.random().toString(36).substring(7),
+      sender: "user",
+      notes: [...currentRecording],
+      timestamp: new Date(),
+    };
+    setMessages((prev) => [...prev, userMsg]);
+    setCurrentRecording([]);
+
+    // 2. Fetch AI Response
+    setIsWaitingForAI(true);
     try {
       const response = await fetch("/api/jam", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
-          notes: recordedNotes, 
+          notes: userMsg.notes, 
           num_generate: numGenerate[0], 
           temperature: temperature[0] 
         }),
@@ -116,15 +129,17 @@ export default function LiveExtend() {
       const data = await response.json();
       const aiNotes: JamNote[] = data.notes;
 
-      // Play back the AI's response immediately!
-      if (instrument.current && audioContext.current && aiNotes.length > 0) {
-        const now = audioContext.current.currentTime + 0.1; // Add tiny buffer
-        aiNotes.forEach((n) => {
-          const startTimeSec = (n.time * TICKS_TO_MS) / 1000;
-          const durationSec = (n.duration * TICKS_TO_MS) / 1000;
-          instrument.current!.play(n.pitch.toString(), now + startTimeSec, { duration: durationSec });
-        });
-        toast({ title: "AI Responded!", description: `Played ${aiNotes.length} notes.` });
+      // 3. Package AI's notes into a message
+      if (aiNotes && aiNotes.length > 0) {
+        const aiMsg: ChatMessage = {
+          id: Math.random().toString(36).substring(7),
+          sender: "ai",
+          notes: aiNotes,
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, aiMsg]);
+      } else {
+        toast({ title: "AI was silent", description: "The model returned no notes." });
       }
     } catch (err) {
       toast({ variant: "destructive", title: "Error", description: String(err) });
@@ -133,7 +148,78 @@ export default function LiveExtend() {
     }
   };
 
-  // A tiny slice of a piano for the UI (C4 to E5)
+  // --- PLAYBACK LOGIC ---
+
+  const playMessage = (notesToPlay: JamNote[]) => {
+    if (!instrument.current || !audioContext.current || notesToPlay.length === 0) return;
+
+    const now = audioContext.current.currentTime + 0.1; 
+    const sortedNotes = [...notesToPlay].sort((a, b) => a.time - b.time);
+    
+    // Normalize so the first note plays instantly
+    const minTime = sortedNotes[0].time;
+
+    sortedNotes.forEach((n) => {
+      const startTimeSec = ((n.time - minTime) * TICKS_TO_MS) / 1000;
+      const durationSec = (n.duration * TICKS_TO_MS) / 1000;
+      instrument.current!.play(n.pitch.toString(), now + startTimeSec, { duration: durationSec });
+    });
+  };
+
+  const playStitchedSession = () => {
+    if (!instrument.current || !audioContext.current || messages.length === 0) return;
+
+    let now = audioContext.current.currentTime + 0.1; 
+
+    messages.forEach((msg) => {
+      if (msg.notes.length === 0) return;
+      const sorted = [...msg.notes].sort((a, b) => a.time - b.time);
+      const minTime = sorted[0].time;
+      let maxTimeInMsg = 0;
+
+      sorted.forEach((n) => {
+        const startTimeSec = ((n.time - minTime) * TICKS_TO_MS) / 1000;
+        const durationSec = (n.duration * TICKS_TO_MS) / 1000;
+        instrument.current!.play(n.pitch.toString(), now + startTimeSec, { duration: durationSec });
+        
+        const noteEndTime = startTimeSec + durationSec;
+        if (noteEndTime > maxTimeInMsg) maxTimeInMsg = noteEndTime;
+      });
+
+      // Advance the timeline clock by the length of this message, plus a tiny 0.2s breath between turns
+      now += maxTimeInMsg + 0.2; 
+    });
+
+    toast({ title: "Playing Session", description: "Stitching back-to-back..." });
+  };
+
+  const downloadMIDI = async () => {
+    // Only exports the most recent user recording for debugging
+    const lastUserMsg = [...messages].reverse().find(m => m.sender === "user");
+    if (!lastUserMsg) return;
+    
+    try {
+      const response = await fetch("/api/jam/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ notes: lastUserMsg.notes, num_generate: 64, temperature: 0.5 }),
+      });
+      if (!response.ok) throw new Error("Failed to export MIDI");
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "jam_debug.mid";
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      toast({ variant: "destructive", title: "Export Error", description: String(err) });
+    }
+  };
+
   const keyboardLayout = [
     { pitch: 60, note: "C4", isBlack: false }, { pitch: 61, note: "C#4", isBlack: true },
     { pitch: 62, note: "D4", isBlack: false }, { pitch: 63, note: "D#4", isBlack: true },
@@ -147,102 +233,159 @@ export default function LiveExtend() {
   ];
 
   return (
-    <div className="w-full max-w-3xl mx-auto py-8">
-      <Card className="shadow-lg border-primary/20">
-        <CardHeader className="text-center">
-          <CardTitle className="text-2xl font-bold flex items-center justify-center gap-2">
-            <Activity className="w-6 h-6 text-primary" /> Live Jam Room
-          </CardTitle>
-          <CardDescription>Call and Response with Amadeus Dual Brains in real-time.</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-8">
-          
-          {/* Step 1: Initialize Audio Context */}
-          {!isReady ? (
-            <div className="flex flex-col items-center justify-center py-12 gap-4 text-muted-foreground">
-              <Volume2 className="w-12 h-12 opacity-50" />
-              <p>Click below to initialize the browser's audio engine.</p>
-              <Button onClick={initializeAudio} size="lg" className="gap-2">
-                <Music className="w-5 h-5" /> Connect Instrument
-              </Button>
-            </div>
-          ) : (
-            <>
-              {/* Virtual Keyboard */}
-              <div className="relative h-48 bg-secondary/20 rounded-t-xl border-b-4 border-primary/50 overflow-hidden flex justify-center p-4 select-none">
-                {keyboardLayout.map((k) => (
-                  <div
-                    key={k.pitch}
-                    onMouseDown={() => playNote(k.pitch)}
-                    onMouseUp={() => stopNote(k.pitch)}
-                    onMouseLeave={() => stopNote(k.pitch)}
-                    className={`relative border border-foreground/20 rounded-b-md cursor-pointer transition-colors ${
-                      k.isBlack 
-                        ? "bg-zinc-900 w-8 h-24 -mx-4 z-10" 
-                        : "bg-white w-12 h-40 z-0"
-                    } ${activeKeys.includes(k.pitch) ? (k.isBlack ? "bg-primary/80" : "bg-primary/20") : ""}`}
-                  />
-                ))}
-              </div>
-              
-              {/* AI Controls */}
-              <div className="grid grid-cols-2 gap-6 p-4 bg-secondary/5 rounded-lg border border-border/50">
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between text-sm">
-                    <label className="font-medium">Creativity (Temp)</label>
-                    <span className="font-mono text-muted-foreground">{temperature[0]}</span>
-                  </div>
-                  <Slider 
-                    value={temperature} 
-                    onValueChange={setTemperature} 
-                    min={0.1} max={1.5} step={0.1} 
-                  />
-                </div>
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between text-sm">
-                    <label className="font-medium">Response Length</label>
-                    <span className="font-mono text-muted-foreground">{numGenerate[0]} notes</span>
-                  </div>
-                  <Slider 
-                    value={numGenerate} 
-                    onValueChange={setNumGenerate} 
-                    min={16} max={128} step={16} 
-                  />
-                </div>
-              </div>
-
-              {/* Controls */}
-              <div className="flex items-center justify-between p-4 bg-secondary/10 rounded-lg">
-                <div className="flex items-center gap-4">
-                  <Button 
-                    onClick={toggleRecording} 
-                    variant={isRecording ? "destructive" : "default"}
-                    className="w-32 gap-2 transition-all"
-                  >
-                    {isRecording ? <Square className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-                    {isRecording ? "Stop" : "Record"}
-                  </Button>
-                  <div className="text-sm text-muted-foreground font-mono">
-                    Notes captured: {recordedNotes.length}
-                  </div>
-                </div>
-
-                <Button 
-                  onClick={sendToAI} 
-                  disabled={recordedNotes.length === 0 || isRecording || isWaitingForAI}
-                  className="w-40 gap-2"
-                >
-                  {isWaitingForAI ? (
-                    <><div className="w-4 h-4 rounded-full border-2 border-current border-t-transparent animate-spin" /> Thinking...</>
-                  ) : (
-                    <><Send className="w-4 h-4" /> Send to AI</>
-                  )}
+    <div className="w-full max-w-4xl mx-auto py-8 flex gap-6">
+      
+      {/* Left Column: The Piano and Controls */}
+      <div className="flex-1 space-y-6">
+        <Card className="shadow-lg border-primary/20">
+          <CardHeader className="text-center pb-4">
+            <CardTitle className="text-2xl font-bold flex items-center justify-center gap-2">
+              <Activity className="w-6 h-6 text-primary" /> Jam Controls
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            {!isReady ? (
+              <div className="flex flex-col items-center justify-center py-12 gap-4 text-muted-foreground">
+                <Volume2 className="w-12 h-12 opacity-50" />
+                <Button onClick={initializeAudio} size="lg" className="gap-2">
+                  <Music className="w-5 h-5" /> Connect Instrument
                 </Button>
               </div>
-            </>
-          )}
-        </CardContent>
-      </Card>
+            ) : (
+              <>
+                {/* Virtual Keyboard */}
+                <div className="relative h-48 bg-secondary/20 rounded-xl border-4 border-primary/50 overflow-hidden flex justify-center p-4 select-none">
+                  {keyboardLayout.map((k) => (
+                    <div
+                      key={k.pitch}
+                      onMouseDown={() => playNote(k.pitch)}
+                      onMouseUp={() => stopNote(k.pitch)}
+                      onMouseLeave={() => stopNote(k.pitch)}
+                      className={`relative border border-foreground/20 rounded-b-md cursor-pointer transition-colors ${
+                        k.isBlack ? "bg-zinc-900 w-8 h-24 -mx-4 z-10" : "bg-white w-12 h-40 z-0"
+                      } ${activeKeys.includes(k.pitch) ? (k.isBlack ? "bg-primary/80" : "bg-primary/20") : ""}`}
+                    />
+                  ))}
+                </div>
+                
+                {/* AI Controls */}
+                <div className="grid grid-cols-2 gap-6 p-4 bg-secondary/5 rounded-lg border border-border/50">
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between text-sm">
+                      <label className="font-medium">Creativity</label>
+                      <span className="font-mono text-muted-foreground">{temperature[0]}</span>
+                    </div>
+                    <Slider value={temperature} onValueChange={setTemperature} min={0.1} max={1.5} step={0.1} />
+                  </div>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between text-sm">
+                      <label className="font-medium">Length</label>
+                      <span className="font-mono text-muted-foreground">{numGenerate[0]}</span>
+                    </div>
+                    <Slider value={numGenerate} onValueChange={setNumGenerate} min={16} max={128} step={16} />
+                  </div>
+                </div>
+
+                {/* Main Action Buttons */}
+                <div className="flex items-center justify-between">
+                  <div className="flex gap-2">
+                    {!isRecording ? (
+                      <Button onClick={startRecording} className="w-32 gap-2" variant="default">
+                        <Mic className="w-4 h-4" /> Record
+                      </Button>
+                    ) : (
+                      <Button onClick={stopAndSend} className="w-32 gap-2" variant="destructive">
+                        <Square className="w-4 h-4" /> Stop & Send
+                      </Button>
+                    )}
+                  </div>
+                  
+                  {isWaitingForAI && (
+                    <div className="flex items-center gap-2 text-primary text-sm font-medium animate-pulse">
+                      <Activity className="w-4 h-4" /> Amadeus is thinking...
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Right Column: The Chat History */}
+      <div className="w-[400px] flex flex-col h-[600px]">
+        <Card className="flex-1 flex flex-col shadow-lg border-border/50 overflow-hidden">
+          <CardHeader className="bg-secondary/10 border-b py-4">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-lg">Session Timeline</CardTitle>
+              <Button 
+                onClick={playStitchedSession} 
+                disabled={messages.length === 0}
+                variant="default" 
+                size="sm" 
+                className="gap-2"
+              >
+                <Play className="w-4 h-4" /> Play All
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent className="flex-1 overflow-y-auto p-4 space-y-4">
+            
+            {messages.length === 0 && (
+              <div className="text-center text-muted-foreground italic mt-20">
+                Hit record, play a melody, and send it to start the jam.
+              </div>
+            )}
+
+            {messages.map((msg) => (
+              <div 
+                key={msg.id} 
+                className={`flex flex-col ${msg.sender === "user" ? "items-end" : "items-start"}`}
+              >
+                <div className="flex items-center gap-2 mb-1 px-1">
+                  {msg.sender === "user" ? <User className="w-3 h-3 opacity-50" /> : <Bot className="w-3 h-3 opacity-50 text-primary" />}
+                  <span className="text-xs font-semibold text-muted-foreground">
+                    {msg.sender === "user" ? "You" : "Amadeus"}
+                  </span>
+                </div>
+                
+                <div className={`p-3 rounded-xl max-w-[85%] shadow-sm ${
+                  msg.sender === "user" 
+                    ? "bg-primary text-primary-foreground rounded-tr-none" 
+                    : "bg-secondary border border-border/50 rounded-tl-none"
+                }`}>
+                  <div className="flex items-center justify-between gap-6">
+                    <span className="text-sm font-mono opacity-80">{msg.notes.length} notes</span>
+                    <div className="flex gap-2">
+                      {msg.sender === "user" && (
+                        <Button 
+                          variant="ghost" 
+                          size="icon" 
+                          className="h-7 w-7 hover:bg-black/10" 
+                          onClick={downloadMIDI}
+                          title="Download Debug MIDI"
+                        >
+                          <Download className="w-3 h-3" />
+                        </Button>
+                      )}
+                      <Button 
+                        variant="ghost" 
+                        size="icon" 
+                        className="h-7 w-7 hover:bg-black/10" 
+                        onClick={() => playMessage(msg.notes)}
+                      >
+                        <Play className="w-3 h-3" />
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+            
+          </CardContent>
+        </Card>
+      </div>
+
     </div>
   );
 }

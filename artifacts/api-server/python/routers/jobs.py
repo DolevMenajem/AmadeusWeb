@@ -8,6 +8,8 @@ from typing import Any, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 import traceback
+import tempfile
+from fastapi.responses import FileResponse
 
 from ..lib.db import get_conn
 from ..lib.midi_gen import generate_output_midi, extract_midi_features, UPLOADS_DIR
@@ -281,7 +283,7 @@ async def live_jam_endpoint(body: JamRequest):
         raise HTTPException(status_code=400, detail="No notes provided")
         
     notes_data = [n.model_dump() for n in body.notes]
-    
+    token_count = body.num_generate
     # Run in an executor thread so we don't freeze the FastAPI web server
     loop = asyncio.get_running_loop()
     try:
@@ -295,9 +297,41 @@ async def live_jam_endpoint(body: JamRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── GET /jobs/:id/download ────────────────────────────────────────────────────
+@router.post("/jam/export", status_code=200)
+async def export_jam_midi(body: JamRequest):
+    """Takes the frontend JSON notes and builds a real .mid file for debugging."""
+    if not body.notes:
+        raise HTTPException(status_code=400, detail="No notes provided")
 
-from fastapi.responses import FileResponse
+    from symusic import Score, Track, Note, Tempo, TimeSignature
+    import os
+    
+    # Build the score exactly how the AI engine builds it
+    score = Score(480) 
+    score.tempos.append(Tempo(time=0, qpm=120))
+    score.time_signatures.append(TimeSignature(time=0, numerator=4, denominator=4))
+    
+    track = Track(program=0, is_drum=False, name="ExportedJam")
+    for n in body.notes:
+        track.notes.append(Note(
+            time=int(n.time), 
+            duration=int(n.duration), 
+            pitch=int(n.pitch), 
+            velocity=int(n.velocity)
+        ))
+        
+    track.notes.sort(key=lambda x: getattr(x, 'time', 0))
+    score.tracks.append(track)
+    
+    # Save to a temporary file
+    fd, path = tempfile.mkstemp(suffix=".mid")
+    os.close(fd)
+    score.dump_midi(path)
+    
+    return FileResponse(path, media_type="audio/midi", filename="jam_debug.mid")
+
+
+# ── GET /jobs/:id/download ────────────────────────────────────────────────────
 
 @router.get("/jobs/{job_id}/download")
 def download_job_result(job_id: int, type: str = "full"):
