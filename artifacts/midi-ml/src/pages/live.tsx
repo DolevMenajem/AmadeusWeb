@@ -193,31 +193,73 @@ export default function LiveExtend() {
     toast({ title: "Playing Session", description: "Stitching back-to-back..." });
   };
 
-  const downloadMIDI = async () => {
-    // Only exports the most recent user recording for debugging
-    const lastUserMsg = [...messages].reverse().find(m => m.sender === "user");
-    if (!lastUserMsg) return;
-    
+// --- EXPORT LOGIC ---
+
+  // Universal helper to send ANY array of notes to the Python export route
+  const exportNotesToMIDI = async (notes: JamNote[], filename: string) => {
     try {
       const response = await fetch("/api/jam/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ notes: lastUserMsg.notes, num_generate: 64, temperature: 0.5 }),
+        // The export route ignores num_generate and temp, but the FastAPI schema requires them
+        body: JSON.stringify({ notes, num_generate: 64, temperature: 0.5 }), 
       });
+
       if (!response.ok) throw new Error("Failed to export MIDI");
 
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "jam_debug.mid";
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
+      
+      toast({ title: "Exported", description: `${filename} downloaded successfully.` });
     } catch (err) {
       toast({ variant: "destructive", title: "Export Error", description: String(err) });
     }
+  };
+
+  // 1. Download a single message (User or AI)
+  const downloadMessage = (msg: ChatMessage) => {
+    const safeId = msg.id.substring(0, 4);
+    exportNotesToMIDI(msg.notes, `jam_${msg.sender}_${safeId}.mid`);
+  };
+
+  // 2. Download the entire stitched timeline
+  const downloadSession = () => {
+    if (messages.length === 0) return;
+    
+    let combinedNotes: JamNote[] = [];
+    let currentTickOffset = 0; // The master clock for the stitched timeline
+
+    messages.forEach((msg) => {
+      if (msg.notes.length === 0) return;
+      
+      const sorted = [...msg.notes].sort((a, b) => a.time - b.time);
+      const minTime = sorted[0].time;
+      let maxTimeInMsgTicks = 0;
+
+      sorted.forEach((n) => {
+        // Shift the note relative to the start of this turn, then add the master offset
+        const shiftedTime = (n.time - minTime) + currentTickOffset;
+        combinedNotes.push({ ...n, time: shiftedTime });
+
+        // Calculate when this specific note finishes
+        const noteEndTimeTicks = shiftedTime + n.duration;
+        if (noteEndTimeTicks > maxTimeInMsgTicks) {
+          maxTimeInMsgTicks = noteEndTimeTicks;
+        }
+      });
+
+      // Advance the master clock to the end of this turn, plus a 1-beat breath (480 ticks)
+      currentTickOffset = maxTimeInMsgTicks + 480; 
+    });
+
+    exportNotesToMIDI(combinedNotes, "jam_full_session.mid");
   };
 
   const keyboardLayout = [
@@ -318,15 +360,27 @@ export default function LiveExtend() {
           <CardHeader className="bg-secondary/10 border-b py-4">
             <div className="flex items-center justify-between">
               <CardTitle className="text-lg">Session Timeline</CardTitle>
-              <Button 
-                onClick={playStitchedSession} 
-                disabled={messages.length === 0}
-                variant="default" 
-                size="sm" 
-                className="gap-2"
-              >
-                <Play className="w-4 h-4" /> Play All
-              </Button>
+              <div className="flex gap-2">
+                <Button 
+                  onClick={downloadSession} 
+                  disabled={messages.length === 0}
+                  variant="outline" 
+                  size="sm" 
+                  className="gap-2"
+                  title="Download Stitched Session"
+                >
+                  <Download className="w-4 h-4" /> Full Session
+                </Button>
+                <Button 
+                  onClick={playStitchedSession} 
+                  disabled={messages.length === 0}
+                  variant="default" 
+                  size="sm" 
+                  className="gap-2"
+                >
+                  <Play className="w-4 h-4" /> Play All
+                </Button>
+              </div>
             </div>
           </CardHeader>
           <CardContent className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -357,17 +411,15 @@ export default function LiveExtend() {
                   <div className="flex items-center justify-between gap-6">
                     <span className="text-sm font-mono opacity-80">{msg.notes.length} notes</span>
                     <div className="flex gap-2">
-                      {msg.sender === "user" && (
-                        <Button 
-                          variant="ghost" 
-                          size="icon" 
-                          className="h-7 w-7 hover:bg-black/10" 
-                          onClick={downloadMIDI}
-                          title="Download Debug MIDI"
-                        >
-                          <Download className="w-3 h-3" />
-                        </Button>
-                      )}
+                      <Button 
+                        variant="ghost" 
+                        size="icon" 
+                        className="h-7 w-7 hover:bg-black/10" 
+                        onClick={() => downloadMessage(msg)}
+                        title="Download this part"
+                      >
+                        <Download className="w-3 h-3" />
+                      </Button>
                       <Button 
                         variant="ghost" 
                         size="icon" 
@@ -385,7 +437,6 @@ export default function LiveExtend() {
           </CardContent>
         </Card>
       </div>
-
     </div>
   );
 }

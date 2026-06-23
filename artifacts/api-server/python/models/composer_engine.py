@@ -422,6 +422,12 @@ class AmadeusComposerOctuple:
         cont_score = self.tokenizer.decode([new_tok_seq])
         if not cont_score.tracks: return []
         
+        if cont_score.tpq != 480:
+            try: 
+                cont_score = cont_score.resample(tpq=480)
+            except: 
+                cont_score = _rescale_score_inplace(cont_score, 480)
+                
         response_notes = []
         raw_notes = cont_score.tracks[0].notes
         
