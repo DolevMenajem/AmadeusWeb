@@ -21,7 +21,8 @@ import { JobStatusBadge } from "@/components/job-status-badge";
 import { Slider } from "@/components/ui/slider";
 import { MidiFileUpload } from "@/components/midi-file-upload";
 import { MidiPlayer } from "@/components/midi-player";
-import { Download, BrainCircuit } from "lucide-react";
+import { Download, BrainCircuit, AudioLines } from "lucide-react";
+import { MidiVisualizer } from  "@/components/midi-visualizer";
 
 // 1. ADDED modelType TO THE SCHEMA
 const formSchema = z.object({
@@ -36,6 +37,7 @@ export default function Extend() {
   const [currentJobId, setCurrentJobId] = useState<number | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
+  const [audioEl, setAudioEl] = useState<HTMLAudioElement | null>(null);
   const { toast } = useToast();
   const queryClient = useQueryClient();
 
@@ -238,13 +240,25 @@ export default function Extend() {
                   {job.status === "completed" && (
                     <div className="space-y-6 pt-4 animate-in fade-in slide-in-from-bottom-2 duration-500">
                       
-                      {/* Audio Player for the Rendered WAV */}
+                    {/* Audio Player for the Rendered WAV */}
                       <div className="space-y-3 bg-secondary/30 p-4 rounded-lg border border-border/50">
                         <h4 className="text-sm font-semibold flex items-center justify-center gap-2">
                           <BrainCircuit className="w-5 h-5 text-primary" /> 
                           AI Studio Render
                         </h4>
+
+                        {/* 1. THE VISUALIZER */}
+                        <div className="mb-2">
+                          <MidiVisualizer 
+                            // We load the "full" track so the visualizer matches the full audio file
+                            midiUrl={`/api/jobs/${job.id}/download?type=full`} 
+                            audioElement={audioEl} 
+                          />
+                        </div>
+
+                        {/* 2. THE UPDATED AUDIO TAG */}
                         <audio 
+                          ref={setAudioEl} // <-- This instantly passes the HTML element to our visualizer state
                           controls 
                           className="w-full h-10 rounded-md" 
                           src={`/api/jobs/${job.id}/download?type=audio`}

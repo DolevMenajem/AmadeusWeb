@@ -157,6 +157,9 @@ importers:
 
   .:
     dependencies:
+      '@tonejs/midi':
+        specifier: ^2.0.28
+        version: 2.0.28
       soundfont-player:
         specifier: ^0.12.0
         version: 0.12.0

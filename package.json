@@ -13,6 +13,7 @@
     "typescript": "~5.9.2"
   },
   "dependencies": {
+    "@tonejs/midi": "^2.0.28",
     "soundfont-player": "^0.12.0"
   }
 }

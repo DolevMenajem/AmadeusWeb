@@ -26,6 +26,113 @@ interface ChatMessage {
   timestamp: Date;
 }
 
+// Add this right below your JamNote and ChatMessage interfaces
+
+interface PianoRollProps {
+  notes: JamNote[];
+  isPlaying: boolean;
+  audioContext: AudioContext | null;
+  playbackStartTime: number | null;
+  color?: string; // To differentiate User (blue) from AI (gray)
+}
+
+function PianoRoll({ notes, isPlaying, audioContext, playbackStartTime, color = "#3b82f6" }: PianoRollProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const TICKS_TO_MS = 1.0416;
+  const PIXELS_PER_SECOND = 80; // How fast the roll scrolls
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || notes.length === 0) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    // 1. Math: Find boundaries to frame the notes perfectly
+    const minTime = Math.min(...notes.map(n => n.time));
+    const maxTime = Math.max(...notes.map(n => n.time + n.duration));
+    const totalDurationSec = ((maxTime - minTime) * TICKS_TO_MS) / 1000;
+    
+    const pitches = notes.map(n => n.pitch);
+    const minPitch = Math.min(...pitches) - 4; // Add padding bottom
+    const maxPitch = Math.max(...pitches) + 4; // Add padding top
+    const pitchRange = maxPitch - minPitch;
+    const rowHeight = canvas.height / pitchRange;
+
+    let animationId: number;
+
+    // 2. The Render Loop
+    const draw = () => {
+      // Clear the canvas
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Determine where the playhead is right now
+      let currentPlayTimeSec = 0;
+      if (isPlaying && audioContext && playbackStartTime) {
+        currentPlayTimeSec = audioContext.currentTime - playbackStartTime;
+        // Stop animating if we've passed the end of the clip
+        if (currentPlayTimeSec > totalDurationSec + 0.5) currentPlayTimeSec = totalDurationSec + 0.5;
+      }
+
+      // We want the playhead fixed at 10% of the canvas width, and the notes slide left
+      const playheadX = canvas.width * 0.1; 
+      const scrollOffset = playheadX - (currentPlayTimeSec * PIXELS_PER_SECOND);
+
+      // Draw horizontal grid lines (Piano keys)
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= pitchRange; i++) {
+        const y = i * rowHeight;
+        ctx.strokeStyle = "rgba(150, 150, 150, 0.1)";
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+        ctx.stroke();
+      }
+
+      // Draw the Notes
+      notes.forEach((n) => {
+        const startTimeSec = ((n.time - minTime) * TICKS_TO_MS) / 1000;
+        const durationSec = (n.duration * TICKS_TO_MS) / 1000;
+        
+        const x = scrollOffset + (startTimeSec * PIXELS_PER_SECOND);
+        const y = canvas.height - ((n.pitch - minPitch) * rowHeight) - rowHeight;
+        const width = Math.max(durationSec * PIXELS_PER_SECOND, 4); // Min width of 4px
+
+        // Draw rounded rectangle for the note
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.roundRect(x, y, width, rowHeight * 0.8, 4);
+        ctx.fill();
+      });
+
+      // Draw the Playhead (Red line)
+      if (isPlaying) {
+        ctx.strokeStyle = "rgba(239, 68, 68, 0.8)"; // Red-500
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(playheadX, 0);
+        ctx.lineTo(playheadX, canvas.height);
+        ctx.stroke();
+      }
+
+      // Loop to next frame
+      animationId = requestAnimationFrame(draw);
+    };
+
+    draw();
+
+    return () => cancelAnimationFrame(animationId);
+  }, [notes, isPlaying, audioContext, playbackStartTime, color]);
+
+  return (
+    <canvas 
+      ref={canvasRef} 
+      width={400} 
+      height={100} 
+      className="w-full h-24 bg-black/5 rounded-md border border-border/50"
+    />
+  );
+}
+
 export default function LiveExtend() {
   const { toast } = useToast();
   const [isReady, setIsReady] = useState(false);
@@ -39,6 +146,10 @@ export default function LiveExtend() {
   
   const [temperature, setTemperature] = useState([0.5]); 
   const [numGenerate, setNumGenerate] = useState([64]);  
+
+  // Playback Trackers
+  const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
+  const [activePlayStartTime, setActivePlayStartTime] = useState<number | null>(null);
 
   const audioContext = useRef<AudioContext | null>(null);
   const instrument = useRef<Soundfont.Player | null>(null);
@@ -150,20 +261,31 @@ export default function LiveExtend() {
 
   // --- PLAYBACK LOGIC ---
 
-  const playMessage = (notesToPlay: JamNote[]) => {
+  const playMessage = (msgId: string, notesToPlay: JamNote[]) => {
     if (!instrument.current || !audioContext.current || notesToPlay.length === 0) return;
 
     const now = audioContext.current.currentTime + 0.1; 
-    const sortedNotes = [...notesToPlay].sort((a, b) => a.time - b.time);
     
-    // Normalize so the first note plays instantly
+    // Tell the Visualizer that THIS message is playing, starting exactly at "now"
+    setPlayingMessageId(msgId);
+    setActivePlayStartTime(now);
+
+    const sortedNotes = [...notesToPlay].sort((a, b) => a.time - b.time);
     const minTime = sortedNotes[0].time;
+    let maxDurationSec = 0;
 
     sortedNotes.forEach((n) => {
       const startTimeSec = ((n.time - minTime) * TICKS_TO_MS) / 1000;
       const durationSec = (n.duration * TICKS_TO_MS) / 1000;
       instrument.current!.play(n.pitch.toString(), now + startTimeSec, { duration: durationSec });
+      
+      if (startTimeSec + durationSec > maxDurationSec) maxDurationSec = startTimeSec + durationSec;
     });
+
+    // Automatically stop the visualizer when the clip ends
+    setTimeout(() => {
+      setPlayingMessageId(null);
+    }, (maxDurationSec + 0.5) * 1000);
   };
 
   const playStitchedSession = () => {
@@ -403,18 +525,30 @@ export default function LiveExtend() {
                   </span>
                 </div>
                 
-                <div className={`p-3 rounded-xl max-w-[85%] shadow-sm ${
+                <div className={`p-3 rounded-xl w-full max-w-[90%] shadow-sm ${
                   msg.sender === "user" 
                     ? "bg-primary text-primary-foreground rounded-tr-none" 
                     : "bg-secondary border border-border/50 rounded-tl-none"
                 }`}>
+                  
+                  {/* THE NEW VISUALIZER */}
+                  <div className="mb-3">
+                     <PianoRoll 
+                       notes={msg.notes} 
+                       isPlaying={playingMessageId === msg.id}
+                       audioContext={audioContext.current}
+                       playbackStartTime={activePlayStartTime}
+                       color={msg.sender === "user" ? "#ffffff" : "#3b82f6"} 
+                     />
+                  </div>
+
                   <div className="flex items-center justify-between gap-6">
                     <span className="text-sm font-mono opacity-80">{msg.notes.length} notes</span>
                     <div className="flex gap-2">
                       <Button 
                         variant="ghost" 
                         size="icon" 
-                        className="h-7 w-7 hover:bg-black/10" 
+                        className={`h-7 w-7 ${msg.sender === "user" ? "hover:bg-black/10" : "hover:bg-primary/10"}`}
                         onClick={() => downloadMessage(msg)}
                         title="Download this part"
                       >
@@ -423,8 +557,8 @@ export default function LiveExtend() {
                       <Button 
                         variant="ghost" 
                         size="icon" 
-                        className="h-7 w-7 hover:bg-black/10" 
-                        onClick={() => playMessage(msg.notes)}
+                        className={`h-7 w-7 ${msg.sender === "user" ? "hover:bg-black/10" : "hover:bg-primary/10"}`}
+                        onClick={() => playMessage(msg.id, msg.notes)}
                       >
                         <Play className="w-3 h-3" />
                       </Button>
