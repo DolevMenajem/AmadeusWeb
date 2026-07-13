@@ -65,6 +65,8 @@ venv/
 # Uploaded MIDI files
 artifacts/api-server/uploads/*.mid
 artifacts/api-server/uploads/*.midi
+artifacts/api-server/uploads/*.wav
+
 
 *.pt
 *.pth
