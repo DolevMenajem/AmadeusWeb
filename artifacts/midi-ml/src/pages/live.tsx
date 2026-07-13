@@ -4,9 +4,10 @@ import { useState, useRef, useEffect } from "react";
 import Soundfont from "soundfont-player";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Music, Mic, Square, Activity, Volume2, Play, User, Bot, Download } from "lucide-react";
+import { Music, Mic, Square, Activity, Volume2, Play, User, Bot, Download, Trash2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { Slider } from "@/components/ui/slider";
+import { useLocalStorage } from "@/hooks/use-local-storage";
 
 const MS_TO_TICKS = 0.96; 
 const TICKS_TO_MS = 1.0416;
@@ -139,8 +140,7 @@ export default function LiveExtend() {
   const [isRecording, setIsRecording] = useState(false);
   const [isWaitingForAI, setIsWaitingForAI] = useState(false);
   
-  // State: The Conversation History & Current Buffer
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages, isHydrated] = useLocalStorage<ChatMessage[]>("amadeus_live_session", []);
   const [currentRecording, setCurrentRecording] = useState<JamNote[]>([]);
   const [activeKeys, setActiveKeys] = useState<number[]>([]);
   
@@ -155,6 +155,7 @@ export default function LiveExtend() {
   const instrument = useRef<Soundfont.Player | null>(null);
   const recordingStartTime = useRef<number>(0);
   const activeNotesMap = useRef<Map<number, number>>(new Map()); 
+  const playbackTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const initializeAudio = async () => {
     try {
@@ -210,7 +211,10 @@ export default function LiveExtend() {
 
   const stopAndSend = async () => {
     setIsRecording(false);
-    if (currentRecording.length === 0) return;
+    if (currentRecording.length === 0) {
+      toast({ variant: "destructive", title: "Empty Recording", description: "You need to play some notes before sending!" });
+      return;
+    }
 
     // 1. Package User's notes into a message
     const userMsg: ChatMessage = {
@@ -262,11 +266,27 @@ export default function LiveExtend() {
   // --- PLAYBACK LOGIC ---
 
   const playMessage = (msgId: string, notesToPlay: JamNote[]) => {
-    if (!instrument.current || !audioContext.current || notesToPlay.length === 0) return;
+    // 1. THE "UNPLUGGED" FIX
+    if (!isReady || !instrument.current || !audioContext.current) {
+      toast({ 
+        variant: "destructive", 
+        title: "Audio Offline", 
+        description: "Please click 'Connect Instrument' on the left before playing audio!" 
+      });
+      return;
+    }
+    if (notesToPlay.length === 0) return;
+
+    // Instantly kill any currently playing audio
+    instrument.current.stop();
+    
+    // 2. THE "PHANTOM TIMEOUT" FIX: Kill the old visualizer timer before starting a new one
+    if (playbackTimeoutRef.current) {
+      clearTimeout(playbackTimeoutRef.current);
+    }
 
     const now = audioContext.current.currentTime + 0.1; 
     
-    // Tell the Visualizer that THIS message is playing, starting exactly at "now"
     setPlayingMessageId(msgId);
     setActivePlayStartTime(now);
 
@@ -282,14 +302,31 @@ export default function LiveExtend() {
       if (startTimeSec + durationSec > maxDurationSec) maxDurationSec = startTimeSec + durationSec;
     });
 
-    // Automatically stop the visualizer when the clip ends
-    setTimeout(() => {
+    // Schedule the new visualizer shutoff, and save its ID so we can kill it later if needed
+    playbackTimeoutRef.current = setTimeout(() => {
       setPlayingMessageId(null);
     }, (maxDurationSec + 0.5) * 1000);
   };
 
   const playStitchedSession = () => {
-    if (!instrument.current || !audioContext.current || messages.length === 0) return;
+    // 1. THE "UNPLUGGED" FIX
+    if (!isReady || !instrument.current || !audioContext.current) {
+      toast({ 
+        variant: "destructive", 
+        title: "Audio Offline", 
+        description: "Please click 'Connect Instrument' on the left before playing audio!" 
+      });
+      return;
+    }
+    if (messages.length === 0) return;
+
+    instrument.current.stop();
+    
+    // 2. THE "PHANTOM TIMEOUT" FIX
+    if (playbackTimeoutRef.current) {
+      clearTimeout(playbackTimeoutRef.current);
+      setPlayingMessageId(null); // Clear any active visualizer highlights
+    }
 
     let now = audioContext.current.currentTime + 0.1; 
 
@@ -482,27 +519,47 @@ export default function LiveExtend() {
           <CardHeader className="bg-secondary/10 border-b py-4">
             <div className="flex items-center justify-between">
               <CardTitle className="text-lg">Session Timeline</CardTitle>
-              <div className="flex gap-2">
-                <Button 
-                  onClick={downloadSession} 
-                  disabled={messages.length === 0}
-                  variant="outline" 
-                  size="sm" 
-                  className="gap-2"
-                  title="Download Stitched Session"
-                >
-                  <Download className="w-4 h-4" /> Full Session
-                </Button>
-                <Button 
-                  onClick={playStitchedSession} 
-                  disabled={messages.length === 0}
-                  variant="default" 
-                  size="sm" 
-                  className="gap-2"
-                >
-                  <Play className="w-4 h-4" /> Play All
-                </Button>
-              </div>
+              
+              {/* Only show controls if the memory has loaded and we have messages */}
+              {isHydrated && (
+                <div className="flex gap-2">
+                  <Button 
+                    onClick={() => {
+                      if (confirm("Are you sure you want to clear this entire session?")) {
+                        setMessages([]);
+                      }
+                    }} 
+                    disabled={messages.length === 0}
+                    variant="ghost" 
+                    size="icon" 
+                    className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                    title="Clear Session"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </Button>
+
+                  <Button 
+                    onClick={downloadSession} 
+                    disabled={messages.length === 0}
+                    variant="outline" 
+                    size="sm" 
+                    className="gap-2"
+                    title="Download Stitched Session"
+                  >
+                    <Download className="w-4 h-4" /> Full Session
+                  </Button>
+                  
+                  <Button 
+                    onClick={playStitchedSession} 
+                    disabled={messages.length === 0}
+                    variant="default" 
+                    size="sm" 
+                    className="gap-2"
+                  >
+                    <Play className="w-4 h-4" /> Play All
+                  </Button>
+                </div>
+              )}
             </div>
           </CardHeader>
           <CardContent className="flex-1 overflow-y-auto p-4 space-y-4">
