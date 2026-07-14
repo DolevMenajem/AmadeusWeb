@@ -13,8 +13,8 @@ import { useLocalStorage } from "@/hooks/use-local-storage";
 import { ArchitectureModal } from "@/components/architecture-modal";
 import { DebugTerminal } from "@/components/debug-terminal";
 
-const MS_TO_TICKS = 0.96; 
-const TICKS_TO_MS = 1.0416;
+const msToTicks = (ms: number, bpm: number) => Math.round((ms / 1000) * (bpm / 60) * 480);
+const ticksToMs = (ticks: number, bpm: number) => (ticks / 480) * (60 / bpm) * 1000;
 
 interface JamNote {
   pitch: number;
@@ -36,11 +36,11 @@ interface PianoRollProps {
   audioContext: AudioContext | null;
   playbackStartTime: number | null;
   color?: string; 
+  bpm: number;
 }
 
-function PianoRoll({ notes, isPlaying, audioContext, playbackStartTime, color = "#3b82f6" }: PianoRollProps) {
+function PianoRoll({ notes, isPlaying, audioContext, playbackStartTime, color = "#3b82f6", bpm }: PianoRollProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const TICKS_TO_MS = 1.0416;
   const PIXELS_PER_SECOND = 80; 
 
   useEffect(() => {
@@ -51,7 +51,9 @@ function PianoRoll({ notes, isPlaying, audioContext, playbackStartTime, color = 
 
     const minTime = Math.min(...notes.map(n => n.time));
     const maxTime = Math.max(...notes.map(n => n.time + n.duration));
-    const totalDurationSec = ((maxTime - minTime) * TICKS_TO_MS) / 1000;
+    
+    // THE FIX: Use our dynamic math function instead of the constant
+    const totalDurationSec = ticksToMs(maxTime - minTime, bpm) / 1000;
     
     const pitches = notes.map(n => n.pitch);
     const minPitch = Math.min(...pitches) - 4; 
@@ -84,8 +86,9 @@ function PianoRoll({ notes, isPlaying, audioContext, playbackStartTime, color = 
       }
 
       notes.forEach((n) => {
-        const startTimeSec = ((n.time - minTime) * TICKS_TO_MS) / 1000;
-        const durationSec = (n.duration * TICKS_TO_MS) / 1000;
+        // THE FIX: Dynamic start time and duration math
+        const startTimeSec = ticksToMs(n.time - minTime, bpm) / 1000;
+        const durationSec = ticksToMs(n.duration, bpm) / 1000;
         
         const x = scrollOffset + (startTimeSec * PIXELS_PER_SECOND);
         const y = canvas.height - ((n.pitch - minPitch) * rowHeight) - rowHeight;
@@ -111,7 +114,7 @@ function PianoRoll({ notes, isPlaying, audioContext, playbackStartTime, color = 
 
     draw();
     return () => cancelAnimationFrame(animationId);
-  }, [notes, isPlaying, audioContext, playbackStartTime, color]);
+  }, [notes, isPlaying, audioContext, playbackStartTime, color, bpm]); // <-- Added bpm to dependency array
 
   return (
     <canvas ref={canvasRef} width={400} height={100} className="w-full h-24 bg-black/5 rounded-md border border-border/50" />
@@ -136,7 +139,6 @@ export default function LiveExtend() {
   const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
   const [activePlayStartTime, setActivePlayStartTime] = useState<number | null>(null);
 
-  // NEW: Terminal State
   const [logs, setLogs] = useState<string[]>([
     `[SYS] UI Initialized. Awaiting audio connection.`
   ]);
@@ -146,6 +148,18 @@ export default function LiveExtend() {
   const recordingStartTime = useRef<number>(0);
   const activeNotesMap = useRef<Map<number, number>>(new Map()); 
   const playbackTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const [bpm, setBpm] = useState([120]);
+  const [metronomeOn, setMetronomeOn] = useState(false);
+  const bpmRef = useRef(120); 
+  const metronomeIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const nextClickTimeRef = useRef<number>(0);
+  const beatCountRef = useRef<number>(0);
+
+  // Keep the Ref in perfect sync with the Slider
+  useEffect(() => {
+    bpmRef.current = bpm[0];
+  }, [bpm]);
 
   // Terminal Logger Helper
   const logSystem = (msg: string) => {
@@ -192,8 +206,8 @@ export default function LiveExtend() {
         ...prev,
         {
           pitch,
-          time: Math.round(startTimeMs * MS_TO_TICKS),
-          duration: Math.max(Math.round(durationMs * MS_TO_TICKS), 120), 
+          time: msToTicks(startTimeMs, bpm[0]), // Dynamic Math
+          duration: Math.max(msToTicks(durationMs, bpm[0]), 60), // Dynamic Math
           velocity: 80, 
         },
       ]);
@@ -205,11 +219,62 @@ export default function LiveExtend() {
     activeNotesMap.current.clear();
     recordingStartTime.current = Date.now();
     setIsRecording(true);
-    logSystem(`[SYS] Recording started. Tracking raw millisecond events...`);
+    
+    logSystem(`[SYS] Recording started at ${bpm[0]} BPM. Metronome: ${metronomeOn ? "ON" : "OFF"}`);
   };
+  
+  // THE DYNAMIC METRONOME ENGINE
+  useEffect(() => {
+    if (!metronomeOn || !audioContext.current) {
+      if (metronomeIntervalRef.current) clearInterval(metronomeIntervalRef.current);
+      return;
+    }
+
+    // Initialize the clock slightly in the future when turned on
+    nextClickTimeRef.current = audioContext.current.currentTime + 0.1;
+    beatCountRef.current = 0;
+
+    const scheduler = () => {
+      if (!audioContext.current) return;
+      
+      // Lookahead: Only schedule a beat if it is happening within the next 100ms
+      while (nextClickTimeRef.current < audioContext.current.currentTime + 0.1) {
+        
+        // 1. Play the click
+        const osc = audioContext.current.createOscillator();
+        const gainNode = audioContext.current.createGain();
+
+        osc.type = "square";
+        osc.frequency.setValueAtTime(beatCountRef.current === 0 ? 800 : 400, nextClickTimeRef.current);
+        gainNode.gain.setValueAtTime(0.1, nextClickTimeRef.current);
+        gainNode.gain.exponentialRampToValueAtTime(0.001, nextClickTimeRef.current + 0.05);
+
+        osc.connect(gainNode);
+        gainNode.connect(audioContext.current.destination);
+
+        osc.start(nextClickTimeRef.current);
+        osc.stop(nextClickTimeRef.current + 0.05);
+
+        // 2. Calculate the next beat using the DYNAMIC ref
+        const secondsPerBeat = 60.0 / bpmRef.current;
+        nextClickTimeRef.current += secondsPerBeat;
+        beatCountRef.current = (beatCountRef.current + 1) % 4;
+      }
+    };
+
+    // Run this check every 25 milliseconds
+    metronomeIntervalRef.current = setInterval(scheduler, 25);
+
+    // Cleanup on unmount or toggle off
+    return () => {
+      if (metronomeIntervalRef.current) clearInterval(metronomeIntervalRef.current);
+    };
+  }, [metronomeOn]); // Only restarts the engine if the ON/OFF toggle changes
 
   const stopAndSend = async () => {
     setIsRecording(false);
+    setMetronomeOn(false);
+    
     if (currentRecording.length === 0) {
       toast({ variant: "destructive", title: "Empty Recording", description: "You need to play some notes before sending!" });
       return;
@@ -237,7 +302,8 @@ export default function LiveExtend() {
         body: JSON.stringify({ 
           notes: userMsg.notes, 
           num_generate: numGenerate[0], 
-          temperature: temperature[0] 
+          temperature: temperature[0],
+          bpm: bpm[0] 
         }),
       });
 
@@ -290,8 +356,8 @@ export default function LiveExtend() {
     logSystem(`[SYS] Scheduling ${notesToPlay.length} notes on hardware AudioContext...`);
 
     sortedNotes.forEach((n) => {
-      const startTimeSec = ((n.time - minTime) * TICKS_TO_MS) / 1000;
-      const durationSec = (n.duration * TICKS_TO_MS) / 1000;
+      const startTimeSec = ticksToMs(n.time - minTime, bpm[0]) / 1000;
+      const durationSec = ticksToMs(n.duration, bpm[0]) / 1000;
       instrument.current!.play(n.pitch.toString(), now + startTimeSec, { duration: durationSec });
       if (startTimeSec + durationSec > maxDurationSec) maxDurationSec = startTimeSec + durationSec;
     });
@@ -325,8 +391,8 @@ export default function LiveExtend() {
       let maxTimeInMsg = 0;
 
       sorted.forEach((n) => {
-        const startTimeSec = ((n.time - minTime) * TICKS_TO_MS) / 1000;
-        const durationSec = (n.duration * TICKS_TO_MS) / 1000;
+        const startTimeSec = ticksToMs(n.time - minTime, bpm[0]) / 1000;
+        const durationSec = ticksToMs(n.duration, bpm[0]) / 1000;
         instrument.current!.play(n.pitch.toString(), now + startTimeSec, { duration: durationSec });
         
         const noteEndTime = startTimeSec + durationSec;
@@ -458,6 +524,7 @@ export default function LiveExtend() {
                 </div>
                 
                 <div className="grid grid-cols-2 gap-6 p-4 bg-secondary/5 rounded-lg border border-border/50">
+                  {/* Your existing Temp & Length sliders */}
                   <div className="space-y-3">
                     <div className="flex items-center justify-between text-sm">
                       <label className="font-medium">Temperature</label>
@@ -471,6 +538,25 @@ export default function LiveExtend() {
                       <span className="font-mono text-muted-foreground">{numGenerate[0]}</span>
                     </div>
                     <Slider value={numGenerate} onValueChange={setNumGenerate} min={16} max={128} step={16} />
+                  </div>
+                  
+                  {/* THE NEW BPM & METRONOME CONTROLS */}
+                  <div className="space-y-3 col-span-2">
+                    <div className="flex items-center justify-between text-sm">
+                      <div className="flex items-center gap-4">
+                        <label className="font-medium">Tempo (BPM)</label>
+                        <Button 
+                          variant={metronomeOn ? "default" : "outline"} 
+                          size="sm" 
+                          className="h-6 text-xs"
+                          onClick={() => setMetronomeOn(!metronomeOn)}
+                        >
+                          Metronome {metronomeOn ? "ON" : "OFF"}
+                        </Button>
+                      </div>
+                      <span className="font-mono text-muted-foreground">{bpm[0]}</span>
+                    </div>
+                    <Slider value={bpm} onValueChange={setBpm} min={60} max={200} step={1} />
                   </div>
                 </div>
 
@@ -608,7 +694,8 @@ export default function LiveExtend() {
                        isPlaying={playingMessageId === msg.id}
                        audioContext={audioContext.current}
                        playbackStartTime={activePlayStartTime}
-                       color={msg.sender === "user" ? "#ffffff" : "#3b82f6"} 
+                       color={msg.sender === "user" ? "#ffffff" : "#3b82f6"}
+                       bpm={bpm[0]} 
                      />
                   </div>
 

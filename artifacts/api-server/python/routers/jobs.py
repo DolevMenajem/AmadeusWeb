@@ -275,6 +275,7 @@ class JamRequest(BaseModel):
     notes: List[JamNote]
     num_generate: int = 64  # Keep it short for fast response (1-2 bars)
     temperature: float = 0.8
+    bpm: int = 120
 
 @router.post("/jam", status_code=200)
 async def live_jam_endpoint(body: JamRequest):
@@ -283,13 +284,12 @@ async def live_jam_endpoint(body: JamRequest):
         raise HTTPException(status_code=400, detail="No notes provided")
         
     notes_data = [n.model_dump() for n in body.notes]
-    token_count = body.num_generate
     # Run in an executor thread so we don't freeze the FastAPI web server
     loop = asyncio.get_running_loop()
     try:
         result_notes = await loop.run_in_executor(
             None,
-            lambda: composer_octuple.live_extend(notes_data, body.num_generate, body.temperature)
+            lambda: composer_octuple.live_extend(notes_data, body.num_generate, body.temperature, body.bpm)
         )
         return {"notes": result_notes}
     except Exception as e:
@@ -308,7 +308,7 @@ async def export_jam_midi(body: JamRequest):
     
     # Build the score exactly how the AI engine builds it
     score = Score(480) 
-    score.tempos.append(Tempo(time=0, qpm=120))
+    score.tempos.append(Tempo(time=0, qpm=body.bpm))
     score.time_signatures.append(TimeSignature(time=0, numerator=4, denominator=4))
     
     track = Track(program=0, is_drum=False, name="ExportedJam")

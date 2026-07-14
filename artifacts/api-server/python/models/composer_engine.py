@@ -370,13 +370,13 @@ class AmadeusComposerOctuple:
 
         return output_midi_path
 
-    def live_extend(self, notes_data, num_generate=64, temperature=0.8):
+    def live_extend(self, notes_data, num_generate=64, temperature=0.8, bpm=120):
         
         print(f"\n--- [LIVE JAM] INCOMING REQUEST ---")
         
         # 1. Build the raw score with explicit Metadata
         raw_score = Score(480) 
-        raw_score.tempos.append(Tempo(time=0, qpm=120))
+        raw_score.tempos.append(Tempo(time=0, qpm=bpm))
         raw_score.time_signatures.append(TimeSignature(time=0, numerator=4, denominator=4))
         
         track = Track(program=0, is_drum=False, name="LiveJam")
