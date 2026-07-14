@@ -4,7 +4,7 @@ import { useState, useRef, useEffect } from "react";
 import Soundfont from "soundfont-player";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Music, Mic, Square, Activity, Volume2, Play, User, Bot, Download, Trash2 } from "lucide-react";
+import { Music, Mic, Square, Activity, Volume2, Play, User, Bot, Download, Trash2, Save } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { Slider } from "@/components/ui/slider";
 import { useLocalStorage } from "@/hooks/use-local-storage";
@@ -141,6 +141,8 @@ export default function LiveExtend() {
   const [isWaitingForAI, setIsWaitingForAI] = useState(false);
   
   const [messages, setMessages, isHydrated] = useLocalStorage<ChatMessage[]>("amadeus_live_session", []);
+  const [savedJams, setSavedJams] = useLocalStorage<any[]>("amadeus_saved_jams", []);
+
   const [currentRecording, setCurrentRecording] = useState<JamNote[]>([]);
   const [activeKeys, setActiveKeys] = useState<number[]>([]);
   
@@ -520,12 +522,42 @@ export default function LiveExtend() {
             <div className="flex items-center justify-between">
               <CardTitle className="text-lg">Session Timeline</CardTitle>
               
-              {/* Only show controls if the memory has loaded and we have messages */}
               {isHydrated && (
                 <div className="flex gap-2">
+                  {/* NEW: SAVE & CLOSE BUTTON */}
                   <Button 
                     onClick={() => {
-                      if (confirm("Are you sure you want to clear this entire session?")) {
+                      if (confirm("Save this session to your Dashboard history and start a new one?")) {
+                        // 1. Package the jam into a synthetic "Job"
+                        const newArchivedJam = {
+                          id: `live-${Date.now()}`, // Generate a unique ID
+                          type: "live_jam",
+                          inputFilename: `Live Jam (${messages.length} turns)`,
+                          status: "completed",
+                          createdAt: new Date(),
+                          isLocal: true,
+                          messages: messages // We save the raw data in case you want to build a resume feature later!
+                        };
+                        // 2. Push it to the permanent history
+                        setSavedJams((prev) => [...(prev || []), newArchivedJam]);
+                        // 3. Clear the active board
+                        setMessages([]);
+                        toast({ title: "Session Saved", description: "Archived to your Dashboard." });
+                      }
+                    }} 
+                    disabled={messages.length === 0}
+                    variant="ghost" 
+                    size="icon" 
+                    className="text-primary hover:bg-primary/10 hover:text-primary"
+                    title="Save & Close Session"
+                  >
+                    <Save className="w-4 h-4" />
+                  </Button>
+
+                  {/* EXISTING TRASH BUTTON */}
+                  <Button 
+                    onClick={() => {
+                      if (confirm("Are you sure you want to clear this entire session? It will NOT be saved.")) {
                         setMessages([]);
                       }
                     }} 
@@ -533,22 +565,21 @@ export default function LiveExtend() {
                     variant="ghost" 
                     size="icon" 
                     className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                    title="Clear Session"
+                    title="Delete Session"
                   >
                     <Trash2 className="w-4 h-4" />
                   </Button>
 
+                  {/* EXISTING DOWNLOAD / PLAY BUTTONS */}
                   <Button 
                     onClick={downloadSession} 
                     disabled={messages.length === 0}
                     variant="outline" 
                     size="sm" 
                     className="gap-2"
-                    title="Download Stitched Session"
                   >
                     <Download className="w-4 h-4" /> Full Session
                   </Button>
-                  
                   <Button 
                     onClick={playStitchedSession} 
                     disabled={messages.length === 0}

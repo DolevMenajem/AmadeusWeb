@@ -3,12 +3,39 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Link } from "wouter";
+import { useLocalStorage } from "@/hooks/use-local-storage";
+import { Activity } from "lucide-react";
 
 export default function Home() {
   const { data: stats, isLoading: statsLoading } = useGetStats();
   const { data: jobs, isLoading: jobsLoading } = useListJobs();
+  
+  // 1. Pull the Live Jam sessions from local memory
+  const [liveMessages, , isActiveHydrated] = useLocalStorage<any[]>("amadeus_live_session", []);
+  const [savedJams, , isSavedHydrated] = useLocalStorage<any[]>("amadeus_saved_jams", []);
 
-  const recentJobs = jobs?.slice(0, 5) || [];
+  // 2. Stitch them together (using the TS-safe spread!)
+  let combinedActivity: any[] = jobs ? [...jobs] : [];
+
+  if (isSavedHydrated && savedJams && savedJams.length > 0) {
+    combinedActivity.push(...savedJams);
+  }
+
+  if (isActiveHydrated && liveMessages && liveMessages.length > 0) {
+    combinedActivity.push({
+      id: "live-active",
+      type: "live_jam",
+      inputFilename: `Active Jam Session (${liveMessages.length} turns)`,
+      status: "in-progress",
+      createdAt: liveMessages[liveMessages.length - 1].timestamp,
+      isLocal: true,
+      isActive: true,
+    });
+  }
+
+  // Sort newest to oldest and take the top 5
+  combinedActivity.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  const recentJobs = combinedActivity.slice(0, 5);
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -66,22 +93,28 @@ export default function Home() {
               No jobs found. Start by running a new job.
             </div>
           ) : (
-            Array.isArray(recentJobs) && recentJobs.map(job => (
-              <Card key={job.id} className="bg-card border-border flex items-center justify-between p-4" data-testid={`card-job-${job.id}`}>
+            recentJobs.map(job => (
+              <Card 
+                key={job.id} 
+                className={`bg-card flex items-center justify-between p-4 ${job.isLocal ? 'border-primary/50 shadow-sm shadow-primary/10' : 'border-border'}`}
+                data-testid={`card-job-${job.id}`}
+              >
                 <div className="flex items-center gap-4">
-                  <div className="w-10 h-10 rounded bg-secondary flex items-center justify-center text-secondary-foreground font-medium text-sm">
-                    {job.type.substring(0, 2).toUpperCase()}
+                  <div className={`w-10 h-10 rounded flex items-center justify-center font-medium text-sm ${job.isLocal ? 'bg-primary/20 text-primary' : 'bg-secondary text-secondary-foreground'}`}>
+                    {job.isLocal ? <Activity className="w-5 h-5" /> : job.type.substring(0, 2).toUpperCase()}
                   </div>
                   <div>
                     <h3 className="font-medium text-foreground">{job.inputFilename}</h3>
                     <div className="flex items-center gap-2 mt-1">
-                      <Badge variant="outline" className="text-xs">{job.type}</Badge>
+                      <Badge variant={job.isLocal ? "default" : "outline"} className="text-xs">
+                        {job.type.replace('_', ' ')}
+                      </Badge>
                       <span className="text-xs text-muted-foreground">{new Date(job.createdAt).toLocaleString()}</span>
                     </div>
                   </div>
                 </div>
                 <div>
-                  <Badge variant={job.status === "completed" ? "default" : job.status === "failed" ? "destructive" : "secondary"}>
+                  <Badge variant={job.status === "completed" ? "default" : job.status === "failed" ? "destructive" : job.status === "in-progress" ? "secondary" : "secondary"}>
                     {job.status}
                   </Badge>
                 </div>
