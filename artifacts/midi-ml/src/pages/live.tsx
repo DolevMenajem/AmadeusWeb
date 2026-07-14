@@ -3,11 +3,15 @@
 import { useState, useRef, useEffect } from "react";
 import Soundfont from "soundfont-player";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Music, Mic, Square, Activity, Volume2, Play, User, Bot, Download, Trash2, Save } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { Slider } from "@/components/ui/slider";
 import { useLocalStorage } from "@/hooks/use-local-storage";
+
+// IMPORT OUR NEW COMPONENTS
+import { ArchitectureModal } from "@/components/architecture-modal";
+import { DebugTerminal } from "@/components/debug-terminal";
 
 const MS_TO_TICKS = 0.96; 
 const TICKS_TO_MS = 1.0416;
@@ -19,7 +23,6 @@ interface JamNote {
   velocity: number;
 }
 
-// NEW: Chat Message Architecture
 interface ChatMessage {
   id: string;
   sender: "user" | "ai";
@@ -27,20 +30,18 @@ interface ChatMessage {
   timestamp: Date;
 }
 
-// Add this right below your JamNote and ChatMessage interfaces
-
 interface PianoRollProps {
   notes: JamNote[];
   isPlaying: boolean;
   audioContext: AudioContext | null;
   playbackStartTime: number | null;
-  color?: string; // To differentiate User (blue) from AI (gray)
+  color?: string; 
 }
 
 function PianoRoll({ notes, isPlaying, audioContext, playbackStartTime, color = "#3b82f6" }: PianoRollProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const TICKS_TO_MS = 1.0416;
-  const PIXELS_PER_SECOND = 80; // How fast the roll scrolls
+  const PIXELS_PER_SECOND = 80; 
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -48,37 +49,30 @@ function PianoRoll({ notes, isPlaying, audioContext, playbackStartTime, color = 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // 1. Math: Find boundaries to frame the notes perfectly
     const minTime = Math.min(...notes.map(n => n.time));
     const maxTime = Math.max(...notes.map(n => n.time + n.duration));
     const totalDurationSec = ((maxTime - minTime) * TICKS_TO_MS) / 1000;
     
     const pitches = notes.map(n => n.pitch);
-    const minPitch = Math.min(...pitches) - 4; // Add padding bottom
-    const maxPitch = Math.max(...pitches) + 4; // Add padding top
+    const minPitch = Math.min(...pitches) - 4; 
+    const maxPitch = Math.max(...pitches) + 4; 
     const pitchRange = maxPitch - minPitch;
     const rowHeight = canvas.height / pitchRange;
 
     let animationId: number;
 
-    // 2. The Render Loop
     const draw = () => {
-      // Clear the canvas
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // Determine where the playhead is right now
       let currentPlayTimeSec = 0;
       if (isPlaying && audioContext && playbackStartTime) {
         currentPlayTimeSec = audioContext.currentTime - playbackStartTime;
-        // Stop animating if we've passed the end of the clip
         if (currentPlayTimeSec > totalDurationSec + 0.5) currentPlayTimeSec = totalDurationSec + 0.5;
       }
 
-      // We want the playhead fixed at 10% of the canvas width, and the notes slide left
       const playheadX = canvas.width * 0.1; 
       const scrollOffset = playheadX - (currentPlayTimeSec * PIXELS_PER_SECOND);
 
-      // Draw horizontal grid lines (Piano keys)
       ctx.lineWidth = 1;
       for (let i = 0; i <= pitchRange; i++) {
         const y = i * rowHeight;
@@ -89,25 +83,22 @@ function PianoRoll({ notes, isPlaying, audioContext, playbackStartTime, color = 
         ctx.stroke();
       }
 
-      // Draw the Notes
       notes.forEach((n) => {
         const startTimeSec = ((n.time - minTime) * TICKS_TO_MS) / 1000;
         const durationSec = (n.duration * TICKS_TO_MS) / 1000;
         
         const x = scrollOffset + (startTimeSec * PIXELS_PER_SECOND);
         const y = canvas.height - ((n.pitch - minPitch) * rowHeight) - rowHeight;
-        const width = Math.max(durationSec * PIXELS_PER_SECOND, 4); // Min width of 4px
+        const width = Math.max(durationSec * PIXELS_PER_SECOND, 4); 
 
-        // Draw rounded rectangle for the note
         ctx.fillStyle = color;
         ctx.beginPath();
         ctx.roundRect(x, y, width, rowHeight * 0.8, 4);
         ctx.fill();
       });
 
-      // Draw the Playhead (Red line)
       if (isPlaying) {
-        ctx.strokeStyle = "rgba(239, 68, 68, 0.8)"; // Red-500
+        ctx.strokeStyle = "rgba(239, 68, 68, 0.8)"; 
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(playheadX, 0);
@@ -115,22 +106,15 @@ function PianoRoll({ notes, isPlaying, audioContext, playbackStartTime, color = 
         ctx.stroke();
       }
 
-      // Loop to next frame
       animationId = requestAnimationFrame(draw);
     };
 
     draw();
-
     return () => cancelAnimationFrame(animationId);
   }, [notes, isPlaying, audioContext, playbackStartTime, color]);
 
   return (
-    <canvas 
-      ref={canvasRef} 
-      width={400} 
-      height={100} 
-      className="w-full h-24 bg-black/5 rounded-md border border-border/50"
-    />
+    <canvas ref={canvasRef} width={400} height={100} className="w-full h-24 bg-black/5 rounded-md border border-border/50" />
   );
 }
 
@@ -149,9 +133,13 @@ export default function LiveExtend() {
   const [temperature, setTemperature] = useState([0.5]); 
   const [numGenerate, setNumGenerate] = useState([64]);  
 
-  // Playback Trackers
   const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
   const [activePlayStartTime, setActivePlayStartTime] = useState<number | null>(null);
+
+  // NEW: Terminal State
+  const [logs, setLogs] = useState<string[]>([
+    `[SYS] UI Initialized. Awaiting audio connection.`
+  ]);
 
   const audioContext = useRef<AudioContext | null>(null);
   const instrument = useRef<Soundfont.Player | null>(null);
@@ -159,14 +147,24 @@ export default function LiveExtend() {
   const activeNotesMap = useRef<Map<number, number>>(new Map()); 
   const playbackTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+  // Terminal Logger Helper
+  const logSystem = (msg: string) => {
+    const timestamp = new Date().toISOString().split('T')[1].slice(0, 12);
+    setLogs(prev => [...prev, `${timestamp} - ${msg}`]);
+  };
+
   const initializeAudio = async () => {
     try {
+      logSystem(`[SYS] Requesting AudioContext access...`);
       const AC = window.AudioContext || (window as any).webkitAudioContext;
       audioContext.current = new AC();
+      logSystem(`[SYS] Fetching Soundfont 'acoustic_grand_piano' (~1MB)...`);
       instrument.current = await Soundfont.instrument(audioContext.current, "acoustic_grand_piano");
       setIsReady(true);
+      logSystem(`[SYS] WebAudio API active. Hardware clock locked.`);
       toast({ title: "Audio Ready", description: "Piano loaded successfully!" });
     } catch (err) {
+      logSystem(`[ERR] Failed to initialize WebAudio API.`);
       toast({ variant: "destructive", title: "Audio Error", description: "Could not load synthesizer." });
     }
   };
@@ -202,13 +200,12 @@ export default function LiveExtend() {
     }
   };
 
-  // --- RECORDING & AI HANDOFF LOGIC ---
-
   const startRecording = () => {
     setCurrentRecording([]);
     activeNotesMap.current.clear();
     recordingStartTime.current = Date.now();
     setIsRecording(true);
+    logSystem(`[SYS] Recording started. Tracking raw millisecond events...`);
   };
 
   const stopAndSend = async () => {
@@ -218,7 +215,8 @@ export default function LiveExtend() {
       return;
     }
 
-    // 1. Package User's notes into a message
+    logSystem(`[SYS] Captured ${currentRecording.length} notes. Quantizing to JSON payload...`);
+
     const userMsg: ChatMessage = {
       id: Math.random().toString(36).substring(7),
       sender: "user",
@@ -228,9 +226,11 @@ export default function LiveExtend() {
     setMessages((prev) => [...prev, userMsg]);
     setCurrentRecording([]);
 
-    // 2. Fetch AI Response
     setIsWaitingForAI(true);
     try {
+      logSystem(`[NET] Initiating POST /api/jam (tokens: ${numGenerate[0]}, temp: ${temperature[0]})...`);
+      logSystem(`[AI] Symusic parser establishing 120BPM temporal grid...`);
+      
       const response = await fetch("/api/jam", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -243,11 +243,12 @@ export default function LiveExtend() {
 
       if (!response.ok) throw new Error("AI Jam Failed");
 
+      logSystem(`[AI] Inference complete. Decoding tensor response...`);
       const data = await response.json();
       const aiNotes: JamNote[] = data.notes;
 
-      // 3. Package AI's notes into a message
       if (aiNotes && aiNotes.length > 0) {
+        logSystem(`[SYS] Network returned ${aiNotes.length} notes. Decompressing TPQ (8 -> 480)...`);
         const aiMsg: ChatMessage = {
           id: Math.random().toString(36).substring(7),
           sender: "ai",
@@ -255,40 +256,30 @@ export default function LiveExtend() {
           timestamp: new Date(),
         };
         setMessages((prev) => [...prev, aiMsg]);
+        logSystem(`[SYS] Hydrating React visualizer...`);
       } else {
+        logSystem(`[ERR] Transformer returned empty sequence.`);
         toast({ title: "AI was silent", description: "The model returned no notes." });
       }
     } catch (err) {
+      logSystem(`[ERR] Network failure: ${String(err)}`);
       toast({ variant: "destructive", title: "Error", description: String(err) });
     } finally {
       setIsWaitingForAI(false);
     }
   };
 
-  // --- PLAYBACK LOGIC ---
-
   const playMessage = (msgId: string, notesToPlay: JamNote[]) => {
-    // 1. THE "UNPLUGGED" FIX
     if (!isReady || !instrument.current || !audioContext.current) {
-      toast({ 
-        variant: "destructive", 
-        title: "Audio Offline", 
-        description: "Please click 'Connect Instrument' on the left before playing audio!" 
-      });
+      toast({ variant: "destructive", title: "Audio Offline", description: "Please click 'Connect Instrument' on the left before playing audio!" });
       return;
     }
     if (notesToPlay.length === 0) return;
 
-    // Instantly kill any currently playing audio
     instrument.current.stop();
-    
-    // 2. THE "PHANTOM TIMEOUT" FIX: Kill the old visualizer timer before starting a new one
-    if (playbackTimeoutRef.current) {
-      clearTimeout(playbackTimeoutRef.current);
-    }
+    if (playbackTimeoutRef.current) clearTimeout(playbackTimeoutRef.current);
 
     const now = audioContext.current.currentTime + 0.1; 
-    
     setPlayingMessageId(msgId);
     setActivePlayStartTime(now);
 
@@ -296,44 +287,39 @@ export default function LiveExtend() {
     const minTime = sortedNotes[0].time;
     let maxDurationSec = 0;
 
+    logSystem(`[SYS] Scheduling ${notesToPlay.length} notes on hardware AudioContext...`);
+
     sortedNotes.forEach((n) => {
       const startTimeSec = ((n.time - minTime) * TICKS_TO_MS) / 1000;
       const durationSec = (n.duration * TICKS_TO_MS) / 1000;
       instrument.current!.play(n.pitch.toString(), now + startTimeSec, { duration: durationSec });
-      
       if (startTimeSec + durationSec > maxDurationSec) maxDurationSec = startTimeSec + durationSec;
     });
 
-    // Schedule the new visualizer shutoff, and save its ID so we can kill it later if needed
     playbackTimeoutRef.current = setTimeout(() => {
       setPlayingMessageId(null);
     }, (maxDurationSec + 0.5) * 1000);
   };
 
   const playStitchedSession = () => {
-    // 1. THE "UNPLUGGED" FIX
     if (!isReady || !instrument.current || !audioContext.current) {
-      toast({ 
-        variant: "destructive", 
-        title: "Audio Offline", 
-        description: "Please click 'Connect Instrument' on the left before playing audio!" 
-      });
+      toast({ variant: "destructive", title: "Audio Offline", description: "Please click 'Connect Instrument' on the left before playing audio!" });
       return;
     }
     if (messages.length === 0) return;
 
     instrument.current.stop();
-    
-    // 2. THE "PHANTOM TIMEOUT" FIX
     if (playbackTimeoutRef.current) {
       clearTimeout(playbackTimeoutRef.current);
-      setPlayingMessageId(null); // Clear any active visualizer highlights
+      setPlayingMessageId(null); 
     }
 
     let now = audioContext.current.currentTime + 0.1; 
+    let totalNotes = 0;
 
     messages.forEach((msg) => {
       if (msg.notes.length === 0) return;
+      totalNotes += msg.notes.length;
       const sorted = [...msg.notes].sort((a, b) => a.time - b.time);
       const minTime = sorted[0].time;
       let maxTimeInMsg = 0;
@@ -347,22 +333,19 @@ export default function LiveExtend() {
         if (noteEndTime > maxTimeInMsg) maxTimeInMsg = noteEndTime;
       });
 
-      // Advance the timeline clock by the length of this message, plus a tiny 0.2s breath between turns
       now += maxTimeInMsg + 0.2; 
     });
 
+    logSystem(`[SYS] Math-stitching ${messages.length} chunks. Scheduled ${totalNotes} notes linearly.`);
     toast({ title: "Playing Session", description: "Stitching back-to-back..." });
   };
 
-// --- EXPORT LOGIC ---
-
-  // Universal helper to send ANY array of notes to the Python export route
   const exportNotesToMIDI = async (notes: JamNote[], filename: string) => {
     try {
+      logSystem(`[NET] Fetching /api/jam/export for binary serialization...`);
       const response = await fetch("/api/jam/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // The export route ignores num_generate and temp, but the FastAPI schema requires them
         body: JSON.stringify({ notes, num_generate: 64, temperature: 0.5 }), 
       });
 
@@ -378,48 +361,42 @@ export default function LiveExtend() {
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
       
+      logSystem(`[SYS] Downloaded compiled payload: ${filename}`);
       toast({ title: "Exported", description: `${filename} downloaded successfully.` });
     } catch (err) {
+      logSystem(`[ERR] Serialization failed: ${String(err)}`);
       toast({ variant: "destructive", title: "Export Error", description: String(err) });
     }
   };
 
-  // 1. Download a single message (User or AI)
   const downloadMessage = (msg: ChatMessage) => {
     const safeId = msg.id.substring(0, 4);
     exportNotesToMIDI(msg.notes, `jam_${msg.sender}_${safeId}.mid`);
   };
 
-  // 2. Download the entire stitched timeline
   const downloadSession = () => {
     if (messages.length === 0) return;
-    
     let combinedNotes: JamNote[] = [];
-    let currentTickOffset = 0; // The master clock for the stitched timeline
+    let currentTickOffset = 0; 
 
     messages.forEach((msg) => {
       if (msg.notes.length === 0) return;
-      
       const sorted = [...msg.notes].sort((a, b) => a.time - b.time);
       const minTime = sorted[0].time;
       let maxTimeInMsgTicks = 0;
 
       sorted.forEach((n) => {
-        // Shift the note relative to the start of this turn, then add the master offset
         const shiftedTime = (n.time - minTime) + currentTickOffset;
         combinedNotes.push({ ...n, time: shiftedTime });
-
-        // Calculate when this specific note finishes
         const noteEndTimeTicks = shiftedTime + n.duration;
         if (noteEndTimeTicks > maxTimeInMsgTicks) {
           maxTimeInMsgTicks = noteEndTimeTicks;
         }
       });
-
-      // Advance the master clock to the end of this turn, plus a 1-beat breath (480 ticks)
       currentTickOffset = maxTimeInMsgTicks + 480; 
     });
 
+    logSystem(`[SYS] Memory timeline stitched. Total ticks: ${currentTickOffset}`);
     exportNotesToMIDI(combinedNotes, "jam_full_session.mid");
   };
 
@@ -438,12 +415,22 @@ export default function LiveExtend() {
   return (
     <div className="w-full max-w-4xl mx-auto py-8 flex gap-6">
       
-      {/* Left Column: The Piano and Controls */}
-      <div className="flex-1 space-y-6">
+      {/* Left Column: The Piano, Controls, and Terminal */}
+      <div className="flex-1 flex flex-col gap-6">
+        
+        {/* NEW: Title & Architecture Modal Header */}
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-2xl font-bold tracking-tight">Amadeus Live Studio</h2>
+            <p className="text-sm text-muted-foreground">Neural call-and-response engine</p>
+          </div>
+          <ArchitectureModal />
+        </div>
+
         <Card className="shadow-lg border-primary/20">
           <CardHeader className="text-center pb-4">
-            <CardTitle className="text-2xl font-bold flex items-center justify-center gap-2">
-              <Activity className="w-6 h-6 text-primary" /> Jam Controls
+            <CardTitle className="text-xl font-bold flex items-center justify-center gap-2">
+              <Activity className="w-5 h-5 text-primary" /> Input Engine
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-6">
@@ -456,7 +443,6 @@ export default function LiveExtend() {
               </div>
             ) : (
               <>
-                {/* Virtual Keyboard */}
                 <div className="relative h-48 bg-secondary/20 rounded-xl border-4 border-primary/50 overflow-hidden flex justify-center p-4 select-none">
                   {keyboardLayout.map((k) => (
                     <div
@@ -471,25 +457,23 @@ export default function LiveExtend() {
                   ))}
                 </div>
                 
-                {/* AI Controls */}
                 <div className="grid grid-cols-2 gap-6 p-4 bg-secondary/5 rounded-lg border border-border/50">
                   <div className="space-y-3">
                     <div className="flex items-center justify-between text-sm">
-                      <label className="font-medium">Creativity</label>
+                      <label className="font-medium">Temperature</label>
                       <span className="font-mono text-muted-foreground">{temperature[0]}</span>
                     </div>
                     <Slider value={temperature} onValueChange={setTemperature} min={0.1} max={1.5} step={0.1} />
                   </div>
                   <div className="space-y-3">
                     <div className="flex items-center justify-between text-sm">
-                      <label className="font-medium">Length</label>
+                      <label className="font-medium">Tokens (Notes)</label>
                       <span className="font-mono text-muted-foreground">{numGenerate[0]}</span>
                     </div>
                     <Slider value={numGenerate} onValueChange={setNumGenerate} min={16} max={128} step={16} />
                   </div>
                 </div>
 
-                {/* Main Action Buttons */}
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
                     {!isRecording ? (
@@ -505,7 +489,7 @@ export default function LiveExtend() {
                   
                   {isWaitingForAI && (
                     <div className="flex items-center gap-2 text-primary text-sm font-medium animate-pulse">
-                      <Activity className="w-4 h-4" /> Amadeus is thinking...
+                      <Activity className="w-4 h-4" /> Inference running...
                     </div>
                   )}
                 </div>
@@ -513,10 +497,13 @@ export default function LiveExtend() {
             )}
           </CardContent>
         </Card>
+
+        {/* NEW: The Debug Terminal */}
+        <DebugTerminal logs={logs} />
       </div>
 
       {/* Right Column: The Chat History */}
-      <div className="w-[400px] flex flex-col h-[600px]">
+      <div className="w-[400px] flex flex-col h-[750px]">
         <Card className="flex-1 flex flex-col shadow-lg border-border/50 overflow-hidden">
           <CardHeader className="bg-secondary/10 border-b py-4">
             <div className="flex items-center justify-between">
@@ -524,24 +511,21 @@ export default function LiveExtend() {
               
               {isHydrated && (
                 <div className="flex gap-2">
-                  {/* NEW: SAVE & CLOSE BUTTON */}
                   <Button 
                     onClick={() => {
                       if (confirm("Save this session to your Dashboard history and start a new one?")) {
-                        // 1. Package the jam into a synthetic "Job"
                         const newArchivedJam = {
-                          id: `live-${Date.now()}`, // Generate a unique ID
+                          id: `live-${Date.now()}`, 
                           type: "live_jam",
                           inputFilename: `Live Jam (${messages.length} turns)`,
                           status: "completed",
                           createdAt: new Date(),
                           isLocal: true,
-                          messages: messages // We save the raw data in case you want to build a resume feature later!
+                          messages: messages 
                         };
-                        // 2. Push it to the permanent history
                         setSavedJams((prev) => [...(prev || []), newArchivedJam]);
-                        // 3. Clear the active board
                         setMessages([]);
+                        logSystem(`[SYS] Memory cleared and saved to SQLite dashboard view.`);
                         toast({ title: "Session Saved", description: "Archived to your Dashboard." });
                       }
                     }} 
@@ -554,11 +538,11 @@ export default function LiveExtend() {
                     <Save className="w-4 h-4" />
                   </Button>
 
-                  {/* EXISTING TRASH BUTTON */}
                   <Button 
                     onClick={() => {
                       if (confirm("Are you sure you want to clear this entire session? It will NOT be saved.")) {
                         setMessages([]);
+                        logSystem(`[SYS] Temporary timeline draft purged.`);
                       }
                     }} 
                     disabled={messages.length === 0}
@@ -570,7 +554,6 @@ export default function LiveExtend() {
                     <Trash2 className="w-4 h-4" />
                   </Button>
 
-                  {/* EXISTING DOWNLOAD / PLAY BUTTONS */}
                   <Button 
                     onClick={downloadSession} 
                     disabled={messages.length === 0}
@@ -619,7 +602,6 @@ export default function LiveExtend() {
                     : "bg-secondary border border-border/50 rounded-tl-none"
                 }`}>
                   
-                  {/* THE NEW VISUALIZER */}
                   <div className="mb-3">
                      <PianoRoll 
                        notes={msg.notes} 
