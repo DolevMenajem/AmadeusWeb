@@ -30,7 +30,7 @@ const formSchema = z.object({
   temperature: z.number().min(0.1).max(2.0),
   topK: z.number().min(0).max(100),
   topP: z.number().min(0.1).max(1.0),
-  modelType: z.enum(["remi", "octuple"]),
+  modelType: z.enum(["remi", "octuple", "tsd"]),
 });
 
 export default function Extend() {
@@ -136,12 +136,13 @@ export default function Extend() {
                       >
                         <option value="remi">Standard Model (Single-Track / REMI)</option>
                         <option value="octuple">Multi-Track Model (Full Band / Octuple)</option>
+                        <option value="tsd">Next-Gen GPT Model (Experimental / TSD)</option>
                       </select>
                     </FormControl>
                     <p className="text-xs text-muted-foreground mt-2">
-                      {field.value === "remi" 
-                        ? "Generates a continuation for only the primary instrument." 
-                        : "Generates a coordinated continuation for drums, bass, chords, and melody simultaneously."}
+                      {field.value === "remi" && "Generates a continuation for only the primary instrument."}
+                      {field.value === "octuple" && "Generates a coordinated continuation for drums, bass, chords, and melody."}
+                      {field.value === "tsd" && "Uses an advanced GPT-style transformer for high-fidelity timing generation."}
                     </p>
                     <FormMessage />
                   </FormItem>
@@ -250,8 +251,8 @@ export default function Extend() {
                         {/* 1. THE VISUALIZER */}
                         <div className="mb-2">
                           <MidiVisualizer 
-                            // We load the "full" track so the visualizer matches the full audio file
                             midiUrl={`/api/jobs/${job.id}/download?type=full`} 
+                            inputMidiUrl={`/api/jobs/${job.id}/download?type=input`} // <-- NEW!
                             audioElement={audioEl} 
                           />
                         </div>

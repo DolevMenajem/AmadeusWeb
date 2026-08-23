@@ -15,27 +15,32 @@ from ..lib.db import get_conn
 from ..lib.midi_gen import generate_output_midi, extract_midi_features, UPLOADS_DIR
 from ..lib.gemini import generate_lecturer_feedback
 
-# --- NEW: DUAL AI BRAIN IMPORT ---
-from ..models.composer_engine import AmadeusComposerREMI, AmadeusComposerOctuple
+# --- TRI BRAIN IMPORT ---
+from ..models.composer_engine import AmadeusComposerREMI, AmadeusComposerOctuple, AmadeusComposerTSD
 
 CURRENT_DIR = Path(__file__).resolve().parent
 MODELS_DIR = CURRENT_DIR.parent / "models"
 
-print("Loading Amadeus Dual Brains into RAM...")
-tokenizer_file = "Compose10k.json"
+print("Loading Amadeus Tri-Brains into RAM...")
 
-# Brain A: Standard (Single-Track)
+# Brain A: REMI
 composer_remi = AmadeusComposerREMI(
     checkpoint_path=str(MODELS_DIR / "checkpoint_best.pt"), 
-    tokenizer_path=str(MODELS_DIR / tokenizer_file)
+    tokenizer_path=str(MODELS_DIR / "Compose10k.json")
 )
 
-# Brain B: Multi-Track (Full Band)
+# Brain B: Octuple
 composer_octuple = AmadeusComposerOctuple(
     checkpoint_path=str(MODELS_DIR / "checkpoint_best_octuple.pt"), 
-    tokenizer_path=str(MODELS_DIR / tokenizer_file)
+    tokenizer_path=str(MODELS_DIR / "Compose_Octuple.json")
 )
-print("Dual Brains Ready.")
+
+# Brain C: The New TSD GPT
+composer_tsd = AmadeusComposerTSD(
+    checkpoint_path=str(MODELS_DIR / "checkpoint_best_tsd.pt"), # Ensure your friend's .pt file is named this
+    tokenizer_path=str(MODELS_DIR / "Compose_TSD.json")
+)
+print("Tri-Brains Ready.")
 # ---------------------------------
 
 router = APIRouter()
@@ -147,7 +152,12 @@ async def simulate_processing(job_id: int, job_type: str, target_genre: str | No
                 tokens_to_generate = (bars or 4) * 32
                 
                 # --- DYNAMIC ROUTING ---
-                active_composer = composer_octuple if model_type == "octuple" else composer_remi
+                if model_type == "octuple":
+                    active_composer = composer_octuple
+                elif model_type == "tsd":
+                    active_composer = composer_tsd
+                else:
+                    active_composer = composer_remi
                 
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
@@ -354,6 +364,10 @@ def download_job_result(job_id: int, type: str = "full"):
         file_name = f"{base_name}.wav"
         media_type = "audio/wav"
         download_name = row["output_filename"].replace(".mid", ".wav")
+    elif type == "input":
+        file_name = row["input_filename"]
+        media_type = "audio/midi"
+        download_name = f"seed_{row['input_filename']}"
     else: # full
         file_name = f"{base_name}_full.mid"
         media_type = "audio/midi"

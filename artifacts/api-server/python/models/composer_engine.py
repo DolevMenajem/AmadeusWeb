@@ -1,10 +1,11 @@
 import os
 import copy
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
-from miditok import REMI, Octuple, TokSequence
+from miditok import REMI, Octuple, TSD, TokSequence
 from symusic import Score, Track, Note, Tempo, TimeSignature
 import tempfile
 
@@ -443,3 +444,213 @@ class AmadeusComposerOctuple:
                 })
                     
         return response_notes
+
+# ─── 3. NEW GPT-STYLE MODEL (TSD) ──────────────────────────────────────────
+
+class _Block(nn.Module):
+    """Pre-norm transformer block with causal SDPA attention."""
+    def __init__(self, d_model, n_heads, dropout):
+        super().__init__()
+        self.n_heads = n_heads
+        self.dropout = dropout
+        self.norm1 = nn.LayerNorm(d_model)
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.attn_out = nn.Linear(d_model, d_model, bias=False)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        B, L, D = x.shape
+        h = self.norm1(x)
+        q, k, v = self.qkv(h).chunk(3, dim=-1)
+        q = q.view(B, L, self.n_heads, -1).transpose(1, 2)
+        k = k.view(B, L, self.n_heads, -1).transpose(1, 2)
+        v = v.view(B, L, self.n_heads, -1).transpose(1, 2)
+        
+        a = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=True,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        a = a.transpose(1, 2).reshape(B, L, D)
+        x = x + self.attn_out(a)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class ComposerGPT(nn.Module):
+    """~40M params at defaults. Fits 2xT4 with AMP at seq_len 512."""
+    def __init__(self, vocab_size, d_model=512, n_layers=8, n_heads=8, max_seq_len=1024, dropout=0.1):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        self.drop = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList(_Block(d_model, n_heads, dropout) for _ in range(n_layers))
+        self.norm_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.head.weight = self.tok_emb.weight  
+
+        self.apply(self._init)
+        for name, p in self.named_parameters():
+            if name.endswith("attn_out.weight") or name.endswith("mlp.2.weight"):
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
+    def forward(self, x, hidden=None): 
+        B, L = x.shape
+        assert L <= self.max_seq_len, f"seq_len {L} > max_seq_len {self.max_seq_len}"
+        pos = torch.arange(L, device=x.device)
+        h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
+        for blk in self.blocks:
+            h = blk(h)
+        return self.head(self.norm_f(h)), None
+
+
+class AmadeusComposerTSD:
+    def __init__(self, checkpoint_path, tokenizer_path):
+        self.device = torch.device("cpu")
+        self.tokenizer = TSD(params=Path(tokenizer_path))
+        
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        cfg = ckpt["config"]
+        self.seq_len = cfg["seq_len"]
+        
+        inv = []
+        bad_words = ["NONE", "PAD", "BOS", "EOS", "MASK", "UNK"]
+        if isinstance(self.tokenizer.vocab, dict):
+            for tstr, tid in self.tokenizer.vocab.items():
+                if any(bw in tstr.upper() for bw in bad_words):
+                    inv.append(tid)
+        self.invalid_ids = torch.tensor(inv, dtype=torch.long)
+        
+        if "pos_emb.weight" in ckpt["model"]:
+            weight_seq_len = ckpt["model"]["pos_emb.weight"].shape[0]
+        else:
+            weight_seq_len = 1024
+
+        # Safely map your existing config dictionary to their new parameter names
+        self.model = ComposerGPT(
+            vocab_size=cfg["vocab_size"], 
+            d_model=cfg.get("embed_size", cfg.get("d_model", 512)),
+            n_layers=cfg.get("num_layers", cfg.get("n_layers", 8)),
+            n_heads=cfg.get("num_heads", cfg.get("n_heads", 8)),
+            max_seq_len= weight_seq_len,
+            dropout=cfg.get("dropout", 0.0)
+        ).to(self.device)
+        
+        self.model.load_state_dict(ckpt["model"])
+        self.model.eval()
+
+    @torch.no_grad()
+    def _generate_tokens(self, prompt_ids, num_tokens, temperature, top_k, top_p):
+        temperature = temperature or 0.8
+        top_k = top_k or 0
+        top_p = top_p or 1.0
+        inv_mask = self.invalid_ids.to(self.device)
+        seq = torch.tensor(list(prompt_ids), dtype=torch.long, device=self.device)
+        
+        for _ in range(num_tokens):
+            context = seq[-self.seq_len:].unsqueeze(0)
+            logits, _ = self.model(context)
+            next_logits = logits[0, -1].float()
+            
+            if len(inv_mask) > 0: next_logits[inv_mask] = -float("inf")
+            next_logits = next_logits / max(temperature, 1e-8)
+            
+            if top_k > 0:
+                indices_to_remove = next_logits < torch.topk(next_logits, top_k)[0][..., -1, None]
+                next_logits[indices_to_remove] = -float('Inf')
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                next_logits[indices_to_remove] = -float('Inf')
+            
+            probs = F.softmax(next_logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1).squeeze()
+            seq = torch.cat([seq, next_id.unsqueeze(0)])
+        return seq.tolist()
+
+    def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0):
+        import subprocess
+        
+        template = Score(str(input_midi_path))
+        combined = copy.deepcopy(template)
+        extension_only = copy.deepcopy(template)
+        for tr in extension_only.tracks:
+            tr.notes.clear()
+
+        for i, tr in enumerate(template.tracks):
+            if len(tr.notes) == 0: continue
+            
+            single = copy.deepcopy(template)
+            single.tracks = [tr]
+            tok_seq = self.tokenizer(single)
+            
+            ids = tok_seq[0].ids if isinstance(tok_seq, list) else tok_seq.ids
+            prompt = ids[-256:] 
+            if not prompt: continue
+            
+            full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k, top_p)
+            cont_ids = full_ids[len(prompt):]
+            if not cont_ids: continue
+            
+            new_tok_seq = TokSequence(ids=cont_ids, are_ids_encoded=True)
+            if hasattr(self.tokenizer, "decode_token_ids"): self.tokenizer.decode_token_ids(new_tok_seq)
+            self.tokenizer.complete_sequence(new_tok_seq)
+            
+            try:
+                cont_score = self.tokenizer.decode([new_tok_seq])
+                if not cont_score.tracks: continue
+                
+                if cont_score.tpq != combined.tpq:
+                    try: cont_score = cont_score.resample(tpq=combined.tpq)
+                    except: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
+                
+                for n in cont_score.tracks[0].notes:
+                    t = getattr(n, 'time', None)
+                    d = getattr(n, 'duration', None)
+                    if t is not None and d is not None and isinstance(t, int) and isinstance(d, int):
+                        combined.tracks[i].notes.append(n)
+                        extension_only.tracks[i].notes.append(copy.deepcopy(n))
+                
+                combined.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                extension_only.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
+            except Exception as e:
+                print(f"Skipping track due to decode error: {e}")
+                
+        min_time = min((n.time for tr in extension_only.tracks for n in tr.notes), default=0)
+        for tr in extension_only.tracks:
+            for n in tr.notes: n.time -= min_time
+
+        base_path_str = str(output_midi_path).replace(".mid", "")
+        full_path = f"{base_path_str}_full.mid"
+        ext_path = f"{base_path_str}_extension.mid"
+        wav_path = f"{base_path_str}.wav"
+        
+        combined.dump_midi(full_path)
+        extension_only.dump_midi(ext_path)
+        
+        soundfont = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
+        try:
+            subprocess.run(["fluidsynth", "-ni", soundfont, full_path, "-F", wav_path, "-r", "44100"], check=True, stdout=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"FluidSynth error: {e}")
+
+        return output_midi_path

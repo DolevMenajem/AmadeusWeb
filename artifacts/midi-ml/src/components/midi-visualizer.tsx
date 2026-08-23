@@ -5,45 +5,96 @@ import { Midi } from "@tonejs/midi";
 
 interface MidiVisualizerProps {
   midiUrl: string;
+  inputMidiUrl?: string; // NEW: The seed file for seam calculation
   audioElement: HTMLAudioElement | null;
   color?: string;
 }
 
-export function MidiVisualizer({ midiUrl, audioElement, color = "#3b82f6" }: MidiVisualizerProps) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [notes, setNotes] = useState<{ pitch: number; timeSec: number; durationSec: number }[]>([]);
+interface ExtractedNote {
+  pitch: number;
+  timeSec: number;
+  durationSec: number;
+  color: string;
+}
 
-  // 1. Fetch and Parse the MIDI File
+export function MidiVisualizer({ midiUrl, inputMidiUrl, audioElement, color = "#3b82f6" }: MidiVisualizerProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [notes, setNotes] = useState<ExtractedNote[]>([]);
+  const [seamTimeSec, setSeamTimeSec] = useState<number | null>(null);
+
   useEffect(() => {
     if (!midiUrl) return;
-    
-    const fetchMidi = async () => {
+    let isMounted = true;
+
+    const fetchMidiData = async () => {
       try {
+        // 1. Fetch the AI's final masterpiece
         const response = await fetch(midiUrl);
         const arrayBuffer = await response.arrayBuffer();
         const parsedMidi = new Midi(arrayBuffer);
         
-        const extractedNotes: { pitch: number; timeSec: number; durationSec: number }[] = [];
-        parsedMidi.tracks.forEach(track => {
+        let detectedSeam = null;
+
+        // 2. Fetch the original seed file to find the exact AI Takeover timestamp
+        if (inputMidiUrl) {
+          try {
+            const inRes = await fetch(inputMidiUrl);
+            if (inRes.ok) {
+              const inBuf = await inRes.arrayBuffer();
+              const inMidi = new Midi(inBuf);
+              let maxTime = 0;
+              // Find the absolute last second of the original file
+              inMidi.tracks.forEach(t => t.notes.forEach(n => {
+                if (n.time + n.duration > maxTime) maxTime = n.time + n.duration;
+              }));
+              detectedSeam = maxTime;
+              if (isMounted) setSeamTimeSec(maxTime);
+            }
+          } catch (err) {
+            console.warn("Could not fetch seed MIDI for seam calculation", err);
+          }
+        }
+        
+        const extractedNotes: ExtractedNote[] = [];
+        
+        // 3. Parse Tracks and Assign Multi-Track Colors
+        parsedMidi.tracks.forEach((track, idx) => {
+          let trackColor = color; 
+          
+          // Detect Instrument Types based on MIDI Channel or Family
+          if (track.channel === 9 || track.instrument.percussion) {
+            trackColor = "#ef4444"; // Red for Drums
+          } else if (track.instrument.family === 'bass' || track.name.toLowerCase().includes('bass')) {
+            trackColor = "#a855f7"; // Purple for Bass
+          } else if (idx === 0 || track.instrument.family === 'piano') {
+            trackColor = "#3b82f6"; // Blue for Piano/Melody
+          } else {
+            trackColor = "#10b981"; // Green for Strings/Other
+          }
+
           track.notes.forEach(note => {
+            // UX Magic: If the note happens before the seam, turn it gray!
+            const isOriginal = detectedSeam && note.time < detectedSeam - 0.1;
+            
             extractedNotes.push({
               pitch: note.midi,
               timeSec: note.time, 
-              durationSec: note.duration
+              durationSec: note.duration,
+              color: isOriginal ? "#6b7280" : trackColor // Gray out the seed track
             });
           });
         });
         
-        setNotes(extractedNotes);
+        if (isMounted) setNotes(extractedNotes);
       } catch (err) {
         console.error("Failed to parse MIDI for visualizer", err);
       }
     };
 
-    fetchMidi();
-  }, [midiUrl]);
+    fetchMidiData();
+    return () => { isMounted = false; };
+  }, [midiUrl, inputMidiUrl, color]);
 
-  // 2. The Render Loop (Locked to the <audio> tag)
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || notes.length === 0) return;
@@ -85,17 +136,41 @@ export function MidiVisualizer({ midiUrl, audioElement, color = "#3b82f6" }: Mid
         ctx.stroke();
       }
 
-      // Draw Notes
+      // Draw Notes with their custom assigned colors
       notes.forEach((n) => {
         const x = scrollOffset + ((n.timeSec - minTime) * PIXELS_PER_SECOND);
         const y = canvas.height - ((n.pitch - minPitch) * rowHeight) - rowHeight;
         const width = Math.max(n.durationSec * PIXELS_PER_SECOND, 4); 
 
-        ctx.fillStyle = color;
+        ctx.fillStyle = n.color;
         ctx.beginPath();
         ctx.roundRect(x, y, width, rowHeight * 0.8, 4);
         ctx.fill();
       });
+
+      // Draw The "AI Takeover" Seam Line
+      if (seamTimeSec !== null) {
+        const seamX = scrollOffset + ((seamTimeSec - minTime) * PIXELS_PER_SECOND);
+        if (seamX > -50 && seamX < canvas.width + 50) {
+          ctx.shadowBlur = 10;
+          ctx.shadowColor = "rgba(234, 179, 8, 0.8)"; 
+          
+          ctx.strokeStyle = "rgba(234, 179, 8, 1)"; // Bright Yellow
+          ctx.lineWidth = 2;
+          ctx.setLineDash([5, 5]); // Dashed line
+          ctx.beginPath();
+          ctx.moveTo(seamX, 0);
+          ctx.lineTo(seamX, canvas.height);
+          ctx.stroke();
+          
+          ctx.setLineDash([]); 
+          ctx.shadowBlur = 0; 
+          
+          ctx.fillStyle = "rgba(234, 179, 8, 1)";
+          ctx.font = "bold 10px sans-serif";
+          ctx.fillText("AI TAKEOVER", seamX + 6, 16);
+        }
+      }
 
       // Draw Playhead
       if (isPlaying) {
@@ -112,14 +187,14 @@ export function MidiVisualizer({ midiUrl, audioElement, color = "#3b82f6" }: Mid
 
     draw();
     return () => cancelAnimationFrame(animationId);
-  }, [notes, audioElement, color]);
+  }, [notes, seamTimeSec, audioElement]);
 
   return (
     <canvas 
       ref={canvasRef} 
       width={600} 
       height={150} 
-      className="w-full h-32 bg-black/5 rounded-md border border-border/50"
+      className="w-full h-32 bg-black/10 rounded-md border border-border/50 shadow-inner"
     />
   );
 }

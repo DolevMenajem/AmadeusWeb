@@ -156,6 +156,10 @@ export default function LiveExtend() {
   const nextClickTimeRef = useRef<number>(0);
   const beatCountRef = useRef<number>(0);
 
+  // QWERTY Keyboard Trackers
+  const pressedKeysRef = useRef<Set<string>>(new Set());
+  const callbacksRef = useRef({ playNote: (p: number) => {}, stopNote: (p: number) => {} });
+
   // Keep the Ref in perfect sync with the Slider
   useEffect(() => {
     bpmRef.current = bpm[0];
@@ -222,6 +226,49 @@ export default function LiveExtend() {
     
     logSystem(`[SYS] Recording started at ${bpm[0]} BPM. Metronome: ${metronomeOn ? "ON" : "OFF"}`);
   };
+
+  // NEW: Keep the callback ref perfectly in sync with the latest render
+  useEffect(() => {
+    callbacksRef.current = { playNote, stopNote };
+  }, [playNote, stopNote]);
+
+  // NEW: Global QWERTY Hardware Listener
+  useEffect(() => {
+    // Maps standard computer keyboard layout to MIDI pitches
+    const keyMap: Record<string, number> = {
+      'a': 60, 'w': 61, 's': 62, 'e': 63, 'd': 64, 'f': 65, 't': 66,
+      'g': 67, 'y': 68, 'h': 69, 'u': 70, 'j': 71, 'k': 72, 'o': 73,
+      'l': 74, 'p': 75, ';': 76
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't play piano if the user is typing in a text box!
+      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) return;
+      
+      const key = e.key.toLowerCase();
+      // Only strike the note if it exists in our map AND hasn't already been pressed
+      if (keyMap[key] !== undefined && !pressedKeysRef.current.has(key)) {
+        pressedKeysRef.current.add(key);
+        callbacksRef.current.playNote(keyMap[key]);
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+      if (keyMap[key] !== undefined) {
+        pressedKeysRef.current.delete(key); // Release the physical lock
+        callbacksRef.current.stopNote(keyMap[key]);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  }, []);
   
   // THE DYNAMIC METRONOME ENGINE
   useEffect(() => {
@@ -466,16 +513,16 @@ export default function LiveExtend() {
     exportNotesToMIDI(combinedNotes, "jam_full_session.mid");
   };
 
-  const keyboardLayout = [
-    { pitch: 60, note: "C4", isBlack: false }, { pitch: 61, note: "C#4", isBlack: true },
-    { pitch: 62, note: "D4", isBlack: false }, { pitch: 63, note: "D#4", isBlack: true },
-    { pitch: 64, note: "E4", isBlack: false }, { pitch: 65, note: "F4", isBlack: false },
-    { pitch: 66, note: "F#4", isBlack: true }, { pitch: 67, note: "G4", isBlack: false },
-    { pitch: 68, note: "G#4", isBlack: true }, { pitch: 69, note: "A4", isBlack: false },
-    { pitch: 70, note: "A#4", isBlack: true }, { pitch: 71, note: "B4", isBlack: false },
-    { pitch: 72, note: "C5", isBlack: false }, { pitch: 73, note: "C#5", isBlack: true },
-    { pitch: 74, note: "D5", isBlack: false }, { pitch: 75, note: "D#5", isBlack: true },
-    { pitch: 76, note: "E5", isBlack: false }
+ const keyboardLayout = [
+    { pitch: 60, note: "C4", isBlack: false, trigger: "A" }, { pitch: 61, note: "C#4", isBlack: true, trigger: "W" },
+    { pitch: 62, note: "D4", isBlack: false, trigger: "S" }, { pitch: 63, note: "D#4", isBlack: true, trigger: "E" },
+    { pitch: 64, note: "E4", isBlack: false, trigger: "D" }, { pitch: 65, note: "F4", isBlack: false, trigger: "F" },
+    { pitch: 66, note: "F#4", isBlack: true, trigger: "T" }, { pitch: 67, note: "G4", isBlack: false, trigger: "G" },
+    { pitch: 68, note: "G#4", isBlack: true, trigger: "Y" }, { pitch: 69, note: "A4", isBlack: false, trigger: "H" },
+    { pitch: 70, note: "A#4", isBlack: true, trigger: "U" }, { pitch: 71, note: "B4", isBlack: false, trigger: "J" },
+    { pitch: 72, note: "C5", isBlack: false, trigger: "K" }, { pitch: 73, note: "C#5", isBlack: true, trigger: "O" },
+    { pitch: 74, note: "D5", isBlack: false, trigger: "L" }, { pitch: 75, note: "D#5", isBlack: true, trigger: "P" },
+    { pitch: 76, note: "E5", isBlack: false, trigger: ";" }
   ];
 
   return (
@@ -509,17 +556,22 @@ export default function LiveExtend() {
               </div>
             ) : (
               <>
-                <div className="relative h-48 bg-secondary/20 rounded-xl border-4 border-primary/50 overflow-hidden flex justify-center p-4 select-none">
+               <div className="relative h-48 bg-secondary/20 rounded-xl border-4 border-primary/50 overflow-hidden flex justify-center p-4 select-none">
                   {keyboardLayout.map((k) => (
                     <div
                       key={k.pitch}
                       onMouseDown={() => playNote(k.pitch)}
                       onMouseUp={() => stopNote(k.pitch)}
                       onMouseLeave={() => stopNote(k.pitch)}
-                      className={`relative border border-foreground/20 rounded-b-md cursor-pointer transition-colors ${
-                        k.isBlack ? "bg-zinc-900 w-8 h-24 -mx-4 z-10" : "bg-white w-12 h-40 z-0"
-                      } ${activeKeys.includes(k.pitch) ? (k.isBlack ? "bg-primary/80" : "bg-primary/20") : ""}`}
-                    />
+                      className={`relative border border-foreground/20 rounded-b-md cursor-pointer transition-colors flex items-end justify-center pb-2 ${
+                        k.isBlack ? "bg-zinc-900 w-8 h-24 -mx-4 z-10 text-white/50" : "bg-white w-12 h-40 z-0 text-zinc-400"
+                      } ${activeKeys.includes(k.pitch) ? (k.isBlack ? "bg-primary/80 text-white" : "bg-primary/20 text-primary") : ""}`}
+                    >
+                      {/* We put the text inside the div, so the div needs a closing tag now! */}
+                      <span className="text-[10px] font-mono font-bold pointer-events-none select-none">
+                        {k.trigger}
+                      </span>
+                    </div>
                   ))}
                 </div>
                 
