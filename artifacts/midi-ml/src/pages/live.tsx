@@ -269,6 +269,64 @@ export default function LiveExtend() {
       window.removeEventListener("keyup", handleKeyUp);
     };
   }, []);
+
+  // NEW: Web MIDI API (Physical Hardware) Listener
+  useEffect(() => {
+    let midiAccess: any = null;
+
+    const handleMIDIMessage = (event: any) => {
+      // The event.data array contains [command, pitch, velocity]
+      const [command, pitch, velocity] = event.data;
+
+      // MIDI Channels 1-16 are mapped to the 144-159 range for "Note On"
+      const isNoteOn = command >= 144 && command <= 159;
+      // MIDI Channels 1-16 are mapped to the 128-143 range for "Note Off"
+      const isNoteOff = command >= 128 && command <= 143;
+
+      if (isNoteOn && velocity > 0) {
+        callbacksRef.current.playNote(pitch);
+      } else if (isNoteOff || (isNoteOn && velocity === 0)) {
+        // Some keyboards send "Note On" with 0 velocity instead of a "Note Off" command
+        callbacksRef.current.stopNote(pitch);
+      }
+    };
+
+    const onMIDISuccess = (access: any) => {
+      midiAccess = access;
+      
+      // 1. Attach listener to all currently connected MIDI inputs
+      access.inputs.forEach((input: any) => {
+        input.onmidimessage = handleMIDIMessage;
+      });
+
+      // 2. Listen for new devices plugged in while the app is already running
+      access.onstatechange = (e: any) => {
+        if (e.port.type === "input" && e.port.state === "connected") {
+          e.port.onmidimessage = handleMIDIMessage;
+        }
+      };
+    };
+
+    const onMIDIFailure = (err: any) => {
+      console.warn("[SYS] Could not access MIDI devices.", err);
+    };
+
+    // Request access from the browser
+    if (navigator.requestMIDIAccess) {
+      navigator.requestMIDIAccess().then(onMIDISuccess, onMIDIFailure);
+    } else {
+      console.warn("[SYS] Web MIDI API not supported in this browser.");
+    }
+
+    return () => {
+      // Cleanup listeners if the component unmounts
+      if (midiAccess) {
+        midiAccess.inputs.forEach((input: any) => {
+          input.onmidimessage = null;
+        });
+      }
+    };
+  }, []);
   
   // THE DYNAMIC METRONOME ENGINE
   useEffect(() => {
