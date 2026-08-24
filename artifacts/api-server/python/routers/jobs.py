@@ -115,22 +115,35 @@ async def simulate_processing(job_id: int, job_type: str, target_genre: str | No
                 features = extract_midi_features(filepath)
 
             try:
-                gemini_str = await generate_lecturer_feedback(target_genre, features)
-                clean_json = gemini_str.replace("```json", "").replace("```", "").strip()
-                ai_data = json.loads(clean_json)
+                # NEW: Fire 3 Gemini requests concurrently!
+                task_theory = generate_lecturer_feedback(target_genre, features, persona="theory")
+                task_rhythm = generate_lecturer_feedback(target_genre, features, persona="rhythm")
+                task_genre = generate_lecturer_feedback(target_genre, features, persona="genre")
+                
+                # Wait for all 3 to finish simultaneously
+                raw_theory, raw_rhythm, raw_genre = await asyncio.gather(task_theory, task_rhythm, task_genre)
+                
+                # Parse all 3 JSON responses
+                data_theory = json.loads(raw_theory.replace("```json", "").replace("```", "").strip())
+                data_rhythm = json.loads(raw_rhythm.replace("```json", "").replace("```", "").strip())
+                data_genre = json.loads(raw_genre.replace("```json", "").replace("```", "").strip())
+                
+                # Calculate an average overall score
+                overall = round((data_theory.get("score", 75) + data_rhythm.get("score", 75) + data_genre.get("score", 75)) / 3)
                 
                 eval_result = {
-                    "overallScore": ai_data.get("overallScore", 75),
-                    "rhythmScore": ai_data.get("rhythmScore", 75),
-                    "harmonyScore": ai_data.get("harmonyScore", 75),
-                    "melodyScore": ai_data.get("melodyScore", 75),
-                    "complexityScore": ai_data.get("complexityScore", 75),
+                    "overallScore": overall,
                     "predictedGenre": target_genre,
                     "genreConfidence": 1.0,
                     "midiFeatures": features,
-                    "lecturerFeedback": ai_data.get("lecturerFeedback", "Excellent piece."),
-                    "summary": ai_data.get("summary", "A solid composition."),
-                    "suggestions": ai_data.get("suggestions", []),
+                    # Combine the feedback into a structured dictionary
+                    "lecturerFeedback": {
+                        "Theory & Harmony": data_theory.get("feedback", ""),
+                        "Rhythm & Groove": data_rhythm.get("feedback", ""),
+                        "Genre Accuracy": data_genre.get("feedback", "")
+                    },
+                    # Combine all suggestions into one master list
+                    "suggestions": data_theory.get("suggestions", []) + data_rhythm.get("suggestions", []) + data_genre.get("suggestions", [])
                 }
             except Exception as e:
                 print(f"JSON Parse Error: {e}")
