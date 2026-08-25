@@ -6,6 +6,7 @@ import {
   getGetStatsQueryKey,
   useGetJob,
   getGetJobQueryKey,
+  useListJobs
 } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
@@ -16,6 +17,7 @@ import { JobStatusBadge } from "@/components/job-status-badge";
 import { Progress } from "@/components/ui/progress";
 import { MidiFileUpload } from "@/components/midi-file-upload";
 import { GraduationCap, Music2, Cpu, BarChart3, Target } from "lucide-react";
+import { Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, Tooltip } from 'recharts';
 
 export default function Evaluate() {
   const [currentJobId, setCurrentJobId] = useState<number | null>(null);
@@ -26,6 +28,9 @@ export default function Evaluate() {
 
   const { toast } = useToast();
   const queryClient = useQueryClient();
+
+  const { data: allJobs } = useListJobs();
+  const evaluationHistory = allJobs?.filter((j: any) => j.type === "evaluate" && j.status === "completed") || [];
 
   const uploadMutation = useUploadMidiFile();
 
@@ -105,58 +110,91 @@ export default function Evaluate() {
         </p>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        <Card className="bg-card border-border h-fit">
-          <CardHeader>
-            <CardTitle>Submit for Analysis</CardTitle>
-            <CardDescription>The Lecturer evaluates your execution against your explicit intent.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-6">
-            
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <label className="text-sm font-medium leading-none">Target Genre / Style</label>
-                <Input 
-                  placeholder="e.g., Cinematic Sci-Fi, Bebop Jazz, Classical Piano..." 
-                  value={targetGenre}
-                  onChange={(e) => setTargetGenre(e.target.value)}
-                  disabled={isPending}
-                />
+ <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        {/* LEFT COLUMN WRAPPER */}
+        <div className="space-y-6">
+          <Card className="bg-card border-border h-fit">
+            <CardHeader>
+              <CardTitle>Submit for Analysis</CardTitle>
+              <CardDescription>The Lecturer evaluates your execution against your explicit intent.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium leading-none">Target Genre / Style</label>
+                  <Input 
+                    placeholder="e.g., Cinematic Sci-Fi, Bebop Jazz, Classical Piano..." 
+                    value={targetGenre}
+                    onChange={(e) => setTargetGenre(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium leading-none">MIDI File</label>
+                  <MidiFileUpload
+                    selectedFile={selectedFile}
+                    onFileSelect={(f) => { setSelectedFile(f); setFormError(null); }}
+                    disabled={isPending}
+                  />
+                </div>
               </div>
 
-              <div className="space-y-2">
-                <label className="text-sm font-medium leading-none">MIDI File</label>
-                <MidiFileUpload
-                  selectedFile={selectedFile}
-                  onFileSelect={(f) => { setSelectedFile(f); setFormError(null); }}
-                  disabled={isPending}
-                />
-              </div>
-            </div>
+              {formError && <p className="text-sm font-medium text-destructive">{formError}</p>}
+              
+              <Button onClick={handleSubmit} disabled={isPending} className="w-full" data-testid="button-submit">
+                {uploadMutation.isPending ? "Uploading..." : evaluateMutation.isPending ? "Submitting..." : "Evaluate Composition"}
+              </Button>
 
-            {formError && <p className="text-sm font-medium text-destructive">{formError}</p>}
-            
-            <Button onClick={handleSubmit} disabled={isPending} className="w-full" data-testid="button-submit">
-              {uploadMutation.isPending ? "Uploading..." : evaluateMutation.isPending ? "Submitting..." : "Evaluate Composition"}
-            </Button>
+              <div className="space-y-2 text-xs text-muted-foreground border-t border-border pt-4">
+                <p className="font-medium text-foreground text-sm">What happens</p>
+                <div className="flex items-start gap-2">
+                  <Target className="w-3 h-3 mt-0.5 shrink-0 text-primary" />
+                  <span>Your target genre anchors the evaluation context</span>
+                </div>
+                <div className="flex items-start gap-2">
+                  <Cpu className="w-3 h-3 mt-0.5 shrink-0 text-primary" />
+                  <span>Local feature extraction — polyphony, velocity variance, pitch range</span>
+                </div>
+                <div className="flex items-start gap-2">
+                  <GraduationCap className="w-3 h-3 mt-0.5 shrink-0 text-violet-400" />
+                  <span>Gemini generates feedback based on how well the math aligns with your intent</span>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
 
-            <div className="space-y-2 text-xs text-muted-foreground border-t border-border pt-4">
-              <p className="font-medium text-foreground text-sm">What happens</p>
-              <div className="flex items-start gap-2">
-                <Target className="w-3 h-3 mt-0.5 shrink-0 text-primary" />
-                <span>Your target genre anchors the evaluation context</span>
+          {/* NEW: Evaluation History Card */}
+          <Card className="bg-card border-border h-fit">
+            <CardHeader>
+              <CardTitle className="text-lg">Evaluation History</CardTitle>
+              <CardDescription>Click to instantly load a past analysis.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-2 max-h-[300px] overflow-y-auto pr-2">
+                {evaluationHistory.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">No past evaluations found.</p>
+                ) : (
+                  evaluationHistory.map((pastJob: any) => (
+                    <Button 
+                      key={pastJob.id}
+                      variant={currentJobId === pastJob.id ? "default" : "outline"}
+                      className="w-full justify-start text-left truncate flex items-center"
+                      onClick={() => setCurrentJobId(pastJob.id)}
+                    >
+                      <span className="truncate flex-1">{pastJob.inputFilename}</span>
+                      <span className="ml-2 text-xs opacity-50 shrink-0">
+                        {pastJob.targetGenre || "General"}
+                      </span>
+                    </Button>
+                  ))
+                )}
               </div>
-              <div className="flex items-start gap-2">
-                <Cpu className="w-3 h-3 mt-0.5 shrink-0 text-primary" />
-                <span>Local feature extraction — polyphony, velocity variance, pitch range</span>
-              </div>
-              <div className="flex items-start gap-2">
-                <GraduationCap className="w-3 h-3 mt-0.5 shrink-0 text-violet-400" />
-                <span>Gemini generates feedback based on how well the math aligns with your intent</span>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+            </CardContent>
+          </Card>
+        </div>
+        {/* END LEFT COLUMN WRAPPER */}
 
         {currentJobId && (
           <div className="space-y-6">
@@ -177,20 +215,44 @@ export default function Evaluate() {
                 ) : job.status === "completed" && result ? (
                   <div className="space-y-8 animate-in fade-in duration-700">
 
-                    {/* Overall score + genre */}
-                    <div className="grid grid-cols-2 gap-4">
-                      <div className="p-4 bg-primary/10 border border-primary/20 rounded-lg text-center">
-                        <div className="text-xs text-primary uppercase tracking-wider font-medium mb-1">Overall Score</div>
-                        <div className="text-5xl font-bold text-primary tracking-tighter" data-testid="score-overall">
-                          {result.overallScore}
+                    {/* Overall score & Radar Chart */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="flex flex-col gap-4">
+                        <div className="p-4 bg-primary/10 border border-primary/20 rounded-lg text-center flex-1 flex flex-col justify-center">
+                          <div className="text-xs text-primary uppercase tracking-wider font-medium mb-1">Overall Score</div>
+                          <div className="text-5xl font-bold text-primary tracking-tighter" data-testid="score-overall">
+                            {result.overallScore}
+                          </div>
                         </div>
+                        {result.predictedGenre && (
+                          <div className="p-4 bg-violet-500/10 border border-violet-500/20 rounded-lg text-center">
+                            <div className="text-xs text-violet-400 uppercase tracking-wider font-medium mb-1">Target Style</div>
+                            <div className="text-xl font-bold text-violet-300 mt-1 line-clamp-2">{result.predictedGenre}</div>
+                          </div>
+                        )}
                       </div>
-                      {result.predictedGenre && (
-                        <div className="p-4 bg-violet-500/10 border border-violet-500/20 rounded-lg text-center">
-                          <div className="text-xs text-violet-400 uppercase tracking-wider font-medium mb-1">Target Style</div>
-                          <div className="text-xl font-bold text-violet-300 mt-1 line-clamp-2">{result.predictedGenre}</div>
-                        </div>
-                      )}
+
+                     <div className="h-[250px] w-full bg-secondary/10 border border-border rounded-lg p-2 flex items-center justify-center">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <RadarChart 
+                            cx="50%"
+                            cy="50%"
+                            outerRadius="55%"
+                            data={[
+                              { subject: 'Theory', score: result.theoryScore || 0, fullMark: 100 },
+                              { subject: 'Rhythm', score: result.rhythmScore || 0, fullMark: 100 },
+                              { subject: 'Genre', score: result.genreScore || 0, fullMark: 100 },
+                              { subject: 'Overall', score: result.overallScore || 0, fullMark: 100 }
+                            ]}
+                          >
+                            <PolarGrid stroke="rgba(255,255,255,0.1)" />
+                            <PolarAngleAxis dataKey="subject" tick={{ fill: 'rgba(255,255,255,0.6)', fontSize: 12 }} />
+                            <PolarRadiusAxis angle={30} domain={[0, 100]} tick={false} axisLine={false} />
+                            <Radar name="Score" dataKey="score" stroke="#8b5cf6" fill="#8b5cf6" fillOpacity={0.4} />
+                            <Tooltip contentStyle={{ backgroundColor: '#18181b', borderColor: '#27272a' }} itemStyle={{ color: '#a78bfa' }} />
+                          </RadarChart>
+                        </ResponsiveContainer>
+                      </div>
                     </div>
 
                     {/* MIDI features */}

@@ -128,11 +128,16 @@ async def simulate_processing(job_id: int, job_type: str, target_genre: str | No
                 data_rhythm = json.loads(raw_rhythm.replace("```json", "").replace("```", "").strip())
                 data_genre = json.loads(raw_genre.replace("```json", "").replace("```", "").strip())
                 
-                # Calculate an average overall score
+                theory_score = data_theory.get("score", 75)
+                rhythm_score = data_rhythm.get("score", 75)
+                genre_score = data_genre.get("score", 75)
                 overall = round((data_theory.get("score", 75) + data_rhythm.get("score", 75) + data_genre.get("score", 75)) / 3)
                 
                 eval_result = {
                     "overallScore": overall,
+                    "theoryScore": theory_score,
+                    "rhythmScore": rhythm_score,
+                    "genreScore": genre_score,
                     "predictedGenre": target_genre,
                     "genreConfidence": 1.0,
                     "midiFeatures": features,
