@@ -202,7 +202,33 @@ export default function Evaluate() {
               <CardHeader className="pb-3 border-b border-border">
                 <div className="flex items-center justify-between">
                   <CardTitle>Analysis Report</CardTitle>
-                  <JobStatusBadge status={job?.status ?? "pending"} />
+                  
+                  {/* WRAP THE BADGE AND CANCEL BUTTON TOGETHER */}
+                  <div className="flex items-center gap-3">
+                    <JobStatusBadge status={job?.status ?? "pending"} />
+                    
+                    {/* ONLY SHOW CANCEL BUTTON IF IT IS PENDING OR PROCESSING */}
+                    {(job?.status === "pending" || job?.status === "processing") && (
+                      <Button 
+                        variant="destructive" 
+                        size="sm"
+                        className="h-7 text-xs"
+                        onClick={async () => {
+                          try {
+                            await fetch(`/api/jobs/${currentJobId}/cancel`, { method: "POST" });
+                            // Force React Query to immediately refresh the UI
+                            queryClient.invalidateQueries({ queryKey: getGetJobQueryKey(currentJobId as number) });
+                            queryClient.invalidateQueries({ queryKey: getListJobsQueryKey() });
+                          } catch (e) {
+                            console.error("Failed to cancel job", e);
+                          }
+                        }}
+                      >
+                        Cancel
+                      </Button>
+                    )}
+                  </div>
+
                 </div>
               </CardHeader>
               <CardContent className="pt-6 space-y-8">

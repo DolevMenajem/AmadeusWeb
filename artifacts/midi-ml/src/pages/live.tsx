@@ -134,7 +134,9 @@ export default function LiveExtend() {
   const [activeKeys, setActiveKeys] = useState<number[]>([]);
   
   const [temperature, setTemperature] = useState([0.5]); 
-  const [numGenerate, setNumGenerate] = useState([64]);  
+  const [numGenerate, setNumGenerate] = useState([64]);
+  const [topK, setTopK] = useState([0]);
+  const [topP, setTopP] = useState([0.95]);
 
   const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
   const [activePlayStartTime, setActivePlayStartTime] = useState<number | null>(null);
@@ -227,12 +229,12 @@ export default function LiveExtend() {
     logSystem(`[SYS] Recording started at ${bpm[0]} BPM. Metronome: ${metronomeOn ? "ON" : "OFF"}`);
   };
 
-  // NEW: Keep the callback ref perfectly in sync with the latest render
+  // Keep the callback ref perfectly in sync with the latest render
   useEffect(() => {
     callbacksRef.current = { playNote, stopNote };
   }, [playNote, stopNote]);
 
-  // NEW: Global QWERTY Hardware Listener
+  // Global QWERTY Hardware Listener
   useEffect(() => {
     // Maps standard computer keyboard layout to MIDI pitches
     const keyMap: Record<string, number> = {
@@ -243,11 +245,11 @@ export default function LiveExtend() {
 
     const handleKeyDown = (e: KeyboardEvent) => {
       // Don't play piano if the user is typing in a text box!
-      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       
       const key = e.key.toLowerCase();
-      // Only strike the note if it exists in our map AND hasn't already been pressed
       if (keyMap[key] !== undefined && !pressedKeysRef.current.has(key)) {
+        e.preventDefault(); // Prevents the browser from scrolling or triggering shortcuts
         pressedKeysRef.current.add(key);
         callbacksRef.current.playNote(keyMap[key]);
       }
@@ -270,7 +272,7 @@ export default function LiveExtend() {
     };
   }, []);
 
-  // NEW: Web MIDI API (Physical Hardware) Listener
+  // Web MIDI API (Physical Hardware) Listener
   useEffect(() => {
     let midiAccess: any = null;
 
@@ -376,6 +378,21 @@ export default function LiveExtend() {
     };
   }, [metronomeOn]); // Only restarts the engine if the ON/OFF toggle changes
 
+  // Global Audio Kill Switch on Tab Change
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden && instrument.current) {
+        instrument.current.stop();
+        if (playbackTimeoutRef.current) clearTimeout(playbackTimeoutRef.current);
+        setPlayingMessageId(null);
+        setActivePlayStartTime(null);
+        logSystem(`[SYS] Tab hidden. Audio playback suspended.`);
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, []);
+
   const stopAndSend = async () => {
     setIsRecording(false);
     setMetronomeOn(false);
@@ -408,6 +425,8 @@ export default function LiveExtend() {
           notes: userMsg.notes, 
           num_generate: numGenerate[0], 
           temperature: temperature[0],
+          top_k: topK[0],
+          top_p: topP[0],
           bpm: bpm[0] 
         }),
       });
@@ -440,13 +459,23 @@ export default function LiveExtend() {
     }
   };
 
-  const playMessage = (msgId: string, notesToPlay: JamNote[]) => {
+const playMessage = (msgId: string, notesToPlay: JamNote[]) => {
     if (!isReady || !instrument.current || !audioContext.current) {
       toast({ variant: "destructive", title: "Audio Offline", description: "Please click 'Connect Instrument' on the left before playing audio!" });
       return;
     }
     if (notesToPlay.length === 0) return;
 
+    if (playingMessageId === msgId) {
+      // If clicking the SAME playing message, Stop it.
+      instrument.current.stop();
+      if (playbackTimeoutRef.current) clearTimeout(playbackTimeoutRef.current);
+      setPlayingMessageId(null);
+      setActivePlayStartTime(null);
+      return;
+    }
+
+    // Stop currently playing track if clicking a DIFFERENT message
     instrument.current.stop();
     if (playbackTimeoutRef.current) clearTimeout(playbackTimeoutRef.current);
 
@@ -648,6 +677,24 @@ export default function LiveExtend() {
                       <span className="font-mono text-muted-foreground">{numGenerate[0]}</span>
                     </div>
                     <Slider value={numGenerate} onValueChange={setNumGenerate} min={16} max={128} step={16} />
+                  </div>
+
+                  {/* NEW: Top K and Top P Settings */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between text-sm">
+                      <label className="font-medium">Top-K</label>
+                      <span className="font-mono text-muted-foreground">{topK[0]}</span>
+                    </div>
+                    <Slider value={topK} onValueChange={setTopK} min={0} max={100} step={1} />
+                    <p className="text-[9px] text-muted-foreground leading-tight">Lower = safe, Higher = chaotic.</p>
+                  </div>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between text-sm">
+                      <label className="font-medium">Top-P</label>
+                      <span className="font-mono text-muted-foreground">{topP[0]}</span>
+                    </div>
+                    <Slider value={topP} onValueChange={setTopP} min={0.1} max={1.0} step={0.05} />
+                    <p className="text-[9px] text-muted-foreground leading-tight">Dynamically filters unlikely notes.</p>
                   </div>
                   
                   {/* THE NEW BPM & METRONOME CONTROLS */}

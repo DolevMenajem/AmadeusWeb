@@ -179,6 +179,9 @@ export default function Extend() {
                     <FormItem>
                       <FormLabel className="flex justify-between"><span>Top-K</span><span className="text-primary font-mono">{field.value ?? 0}</span></FormLabel>
                       <FormControl><Slider min={0} max={100} step={1} value={[field.value ?? 0]} onValueChange={(vals) => field.onChange(vals[0])} /></FormControl>
+                      <p className="text-[10px] text-muted-foreground leading-tight mt-1">
+                        Limits the AI to the K most likely notes. Lower values are safer and predictable; higher values allow creative leaps (0 disables).
+                      </p>
                     </FormItem>
                   )} />
                   
@@ -186,6 +189,9 @@ export default function Extend() {
                     <FormItem>
                       <FormLabel className="flex justify-between"><span>Top-P</span><span className="text-primary font-mono">{Number(field.value ?? 1.0).toFixed(2)}</span></FormLabel>
                       <FormControl><Slider min={0.1} max={1.0} step={0.05} value={[field.value ?? 1.0]} onValueChange={(vals) => field.onChange(vals[0])} /></FormControl>
+                      <p className="text-[10px] text-muted-foreground leading-tight mt-1">
+                        Dynamically filters out highly unlikely notes. 0.90 provides balanced variety; 0.50 forces rigid, conservative structures.
+                      </p>
                     </FormItem>
                   )} />
                 </div>
@@ -204,7 +210,33 @@ export default function Extend() {
             <CardHeader className="pb-3 border-b border-border">
               <div className="flex items-center justify-between">
                 <CardTitle>Result</CardTitle>
-                <JobStatusBadge status={job?.status ?? "pending"} />
+
+                {/* WRAP THE BADGE AND CANCEL BUTTON TOGETHER */}
+                <div className="flex items-center gap-3">
+                  <JobStatusBadge status={job?.status ?? "pending"} />
+                  
+                  {/* ONLY SHOW CANCEL BUTTON IF IT IS PENDING OR PROCESSING */}
+                  {(job?.status === "pending" || job?.status === "processing") && (
+                    <Button 
+                      variant="destructive" 
+                      size="sm"
+                      className="h-7 text-xs"
+                      onClick={async () => {
+                        try {
+                          await fetch(`/api/jobs/${currentJobId}/cancel`, { method: "POST" });
+                          // Force React Query to immediately refresh the UI
+                          queryClient.invalidateQueries({ queryKey: getGetJobQueryKey(currentJobId as number) });
+                          queryClient.invalidateQueries({ queryKey: getListJobsQueryKey() });
+                        } catch (e) {
+                          console.error("Failed to cancel job", e);
+                        }
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  )}
+                </div>
+
               </div>
             </CardHeader>
             <CardContent className="pt-6 space-y-6">

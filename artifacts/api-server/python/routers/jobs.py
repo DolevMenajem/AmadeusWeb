@@ -25,8 +25,8 @@ print("Loading Amadeus Tri-Brains into RAM...")
 
 # Brain A: REMI
 composer_remi = AmadeusComposerREMI(
-    checkpoint_path=str(MODELS_DIR / "checkpoint_best.pt"), 
-    tokenizer_path=str(MODELS_DIR / "Compose10k.json")
+    checkpoint_path=str(MODELS_DIR / "BIG_REMI.pt"), 
+    tokenizer_path=str(MODELS_DIR / "Compose_REMI.json")
 )
 
 # Brain B: Octuple
@@ -44,7 +44,7 @@ print("Tri-Brains Ready.")
 # ---------------------------------
 
 router = APIRouter()
-
+RUNNING_TASKS: dict[int, asyncio.Task] = {}
 GENRE_LABELS = {
     "jazz": "Jazz", "classical": "Classical", "blues": "Blues",
     "electronic": "Electronic", "bossa-nova": "Bossa Nova", "rock": "Rock",
@@ -198,6 +198,11 @@ async def simulate_processing(job_id: int, job_type: str, target_genre: str | No
                 "output_filename": output_filename,
             })
 
+    except asyncio.CancelledError:
+        print(f"[SYS] Job {job_id} cancelled by user.")
+        _set_status(job_id, "cancelled")
+        raise
+
     except Exception as e:
         traceback.print_exc()
         _fail_job(job_id, f"Internal error: {str(e)}")
@@ -246,10 +251,12 @@ async def extend_midi(body: ExtendInput):
                 ("extend", "pending", body.inputFilename, body.barsToExtend),
             )
             row = cur.fetchone()
-    asyncio.create_task(simulate_processing(
+    task = asyncio.create_task(simulate_processing(
         row["id"], "extend", bars=body.barsToExtend, input_filename=body.inputFilename, 
         temperature=body.temperature, top_k=body.topK, top_p=body.topP, model_type=body.modelType
     ))
+    RUNNING_TASKS[row["id"]] = task
+    task.add_done_callback(lambda t, jid=row["id"]: RUNNING_TASKS.pop(jid, None))
     return serialize_job(row)
 
 
@@ -287,7 +294,10 @@ async def evaluate_midi(body: EvaluateInput):
                 ("evaluate", "pending", body.inputFilename, body.targetGenre),
             )
             row = cur.fetchone()
-    asyncio.create_task(simulate_processing(row["id"], "evaluate", target_genre=body.targetGenre, input_filename=body.inputFilename))
+    task = asyncio.create_task(simulate_processing(row["id"], "evaluate",
+                                 target_genre=body.targetGenre, input_filename=body.inputFilename))
+    RUNNING_TASKS[row["id"]] = task
+    task.add_done_callback(lambda t, jid=row["id"]: RUNNING_TASKS.pop(jid, None))
     return serialize_job(row)
 
 
@@ -324,7 +334,6 @@ async def live_jam_endpoint(body: JamRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.post("/jam/export", status_code=200)
 async def export_jam_midi(body: JamRequest):
     """Takes the frontend JSON notes and builds a real .mid file for debugging."""
@@ -358,9 +367,7 @@ async def export_jam_midi(body: JamRequest):
     
     return FileResponse(path, media_type="audio/midi", filename="jam_debug.mid")
 
-
 # ── GET /jobs/:id/download ────────────────────────────────────────────────────
-
 @router.get("/jobs/{job_id}/download")
 def download_job_result(job_id: int, type: str = "full"):
     with get_conn() as conn:
@@ -403,3 +410,25 @@ def download_job_result(job_id: int, type: str = "full"):
         raise HTTPException(status_code=404, detail="File not found on disk")
         
     return FileResponse(path=file_path, filename=download_name, media_type=media_type)
+
+# Job cancelation
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: int):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM jobs WHERE id = %s", (job_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Job not found")
+
+            if row["status"] in ["completed", "failed", "cancelled"]:
+                return {"message": f"Job already {row['status']}"}
+
+            cur.execute("UPDATE jobs SET status = 'cancelled' WHERE id = %s", (job_id,))
+
+    # Cancel the asyncio background worker if still running
+    task = RUNNING_TASKS.pop(job_id, None)
+    if task and not task.done():
+        task.cancel()
+
+    return {"message": f"Job {job_id} cancelled"}
