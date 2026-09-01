@@ -109,7 +109,7 @@ export default function Jobs() {
   const { data: jobs, isLoading } = useListJobs();
 
   const [liveMessages, , isActiveHydrated] = useLocalStorage<any[]>("amadeus_live_session", []);
-  const [savedJams, , isSavedHydrated] = useLocalStorage<any[]>("amadeus_saved_jams", []);
+  const [savedJams, setSavedJams , isSavedHydrated] = useLocalStorage<any[]>("amadeus_saved_jams", []);
 
   // Stitch and sort the timeline
   let combinedActivity: any[] = jobs ? [...jobs] : [];
@@ -185,8 +185,25 @@ export default function Jobs() {
                       </TableCell>
                       <TableCell className={`font-medium ${job.isLocal ? "text-primary" : ""}`}>
                         {job.isLocal ? (
-                          job.inputFilename
+                          job.isActive ? (
+                            // Do not allow renaming the actively running live session from the table
+                            job.inputFilename
+                          ) : (
+                            // Pass a custom onSave handler to modify localStorage for archived jams
+                            <InlineEdit 
+                              jobId={job.id} 
+                              initialValue={job.inputFilename} 
+                              onSave={async (newValue) => {
+                                const updatedJams = savedJams.map((j: any) => 
+                                  j.id === job.id ? { ...j, inputFilename: newValue } : j
+                                );
+                                // This comes from your existing useLocalStorage hook at the top of jobs.tsx
+                                setSavedJams(updatedJams); 
+                              }}
+                            />
+                          )
                         ) : (
+                          // Standard API-backed offline jobs
                           <InlineEdit jobId={job.id} initialValue={job.inputFilename} />
                         )}
                       </TableCell>

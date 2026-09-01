@@ -6,11 +6,12 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 
 interface InlineEditProps {
-  jobId: number;
+  jobId: number | string; // <-- Supports both DB numbers and "live-123" strings
   initialValue: string;
+  onSave?: (newValue: string) => Promise<void>; // <-- Optional override for Live Jams
 }
 
-export function InlineEdit({ jobId, initialValue }: InlineEditProps) {
+export function InlineEdit({ jobId, initialValue, onSave }: InlineEditProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [value, setValue] = useState(initialValue);
   const [isSaving, setIsSaving] = useState(false);
@@ -32,14 +33,19 @@ export function InlineEdit({ jobId, initialValue }: InlineEditProps) {
 
     setIsSaving(true);
     try {
-      await fetch(`/api/jobs/${jobId}/rename`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ newFilename: value }),
-      });
-      // Refresh the UI locally
-      queryClient.invalidateQueries({ queryKey: getGetJobQueryKey(jobId) });
-      queryClient.invalidateQueries({ queryKey: getListJobsQueryKey() });
+      if (onSave) {
+        // Use custom local storage save if provided (for Live Jams)
+        await onSave(value);
+      } else {
+        // Otherwise, hit the normal backend DB route
+        await fetch(`/api/jobs/${jobId}/rename`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ newFilename: value }),
+        });
+        queryClient.invalidateQueries({ queryKey: getGetJobQueryKey(jobId as number) });
+        queryClient.invalidateQueries({ queryKey: getListJobsQueryKey() });
+      }
       setIsEditing(false);
     } catch (e) {
       console.error("Failed to rename job", e);
