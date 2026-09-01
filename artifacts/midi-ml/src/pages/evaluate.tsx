@@ -18,10 +18,11 @@ import { Progress } from "@/components/ui/progress";
 import { MidiFileUpload } from "@/components/midi-file-upload";
 import { GraduationCap, Music2, Cpu, BarChart3, Target } from "lucide-react";
 import { Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, Tooltip } from 'recharts';
+import { useLocalStorage } from "@/hooks/use-local-storage";
+import { InlineEdit } from "@/components/inline-edit";
 
 export default function Evaluate() {
-  const [currentJobId, setCurrentJobId] = useState<number | null>(null);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [currentJobId, setCurrentJobId] = useLocalStorage<number | null>("amadeus_evaluate_job_id", null);  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [targetGenre, setTargetGenre] = useState<string>("");
   const [formError, setFormError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"Theory & Harmony" | "Rhythm & Groove" | "Genre Accuracy">("Theory & Harmony");
@@ -177,17 +178,29 @@ export default function Evaluate() {
                   <p className="text-sm text-muted-foreground">No past evaluations found.</p>
                 ) : (
                   evaluationHistory.map((pastJob: any) => (
-                    <Button 
+                    <div 
                       key={pastJob.id}
-                      variant={currentJobId === pastJob.id ? "default" : "outline"}
-                      className="w-full justify-start text-left truncate flex items-center"
-                      onClick={() => setCurrentJobId(pastJob.id)}
+                      className={`w-full flex items-center justify-between p-2 rounded-md border text-sm transition-colors ${
+                        currentJobId === pastJob.id 
+                          ? "bg-primary text-primary-foreground border-primary" 
+                          : "bg-background border-input hover:bg-accent hover:text-accent-foreground"
+                      }`}
                     >
-                      <span className="truncate flex-1">{pastJob.inputFilename}</span>
-                      <span className="ml-2 text-xs opacity-50 shrink-0">
+                      {/* Clicking the container selects the job */}
+                      <div 
+                        className="truncate flex-1 flex items-center gap-2 cursor-pointer" 
+                        onClick={() => setCurrentJobId(pastJob.id)}
+                      >
+                        <InlineEdit jobId={pastJob.id} initialValue={pastJob.inputFilename} />
+                      </div>
+                      
+                      <span 
+                        className="ml-2 text-xs opacity-50 shrink-0 cursor-pointer"
+                        onClick={() => setCurrentJobId(pastJob.id)}
+                      >
                         {pastJob.targetGenre || "General"}
                       </span>
-                    </Button>
+                    </div>
                   ))
                 )}
               </div>
@@ -203,10 +216,20 @@ export default function Evaluate() {
                 <div className="flex items-center justify-between">
                   <CardTitle>Analysis Report</CardTitle>
                   
-                  {/* WRAP THE BADGE AND CANCEL BUTTON TOGETHER */}
                   <div className="flex items-center gap-3">
                     <JobStatusBadge status={job?.status ?? "pending"} />
                     
+                    {/* NEW: Background / Clear Button */}
+                    <Button 
+                      variant="outline" 
+                      size="sm"
+                      className="h-7 text-xs"
+                      onClick={() => setCurrentJobId(null)}
+                      title="Clear this view to start a new job. This job will continue in the background."
+                    >
+                      New Job
+                    </Button>
+
                     {/* ONLY SHOW CANCEL BUTTON IF IT IS PENDING OR PROCESSING */}
                     {(job?.status === "pending" || job?.status === "processing") && (
                       <Button 
@@ -216,7 +239,6 @@ export default function Evaluate() {
                         onClick={async () => {
                           try {
                             await fetch(`/api/jobs/${currentJobId}/cancel`, { method: "POST" });
-                            // Force React Query to immediately refresh the UI
                             queryClient.invalidateQueries({ queryKey: getGetJobQueryKey(currentJobId as number) });
                             queryClient.invalidateQueries({ queryKey: getListJobsQueryKey() });
                           } catch (e) {
@@ -228,7 +250,6 @@ export default function Evaluate() {
                       </Button>
                     )}
                   </div>
-
                 </div>
               </CardHeader>
               <CardContent className="pt-6 space-y-8">

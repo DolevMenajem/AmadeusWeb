@@ -23,6 +23,8 @@ import { MidiFileUpload } from "@/components/midi-file-upload";
 import { MidiPlayer } from "@/components/midi-player";
 import { Download, BrainCircuit, AudioLines } from "lucide-react";
 import { MidiVisualizer } from  "@/components/midi-visualizer";
+import { useLocalStorage } from "@/hooks/use-local-storage";
+import { InlineEdit } from "@/components/inline-edit";
 
 // 1. ADDED modelType TO THE SCHEMA
 const formSchema = z.object({
@@ -34,8 +36,7 @@ const formSchema = z.object({
 });
 
 export default function Extend() {
-  const [currentJobId, setCurrentJobId] = useState<number | null>(null);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [currentJobId, setCurrentJobId] = useLocalStorage<number | null>("amadeus_extend_job_id", null);  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
   const [audioEl, setAudioEl] = useState<HTMLAudioElement | null>(null);
   const { toast } = useToast();
@@ -211,10 +212,18 @@ export default function Extend() {
               <div className="flex items-center justify-between">
                 <CardTitle>Result</CardTitle>
 
-                {/* WRAP THE BADGE AND CANCEL BUTTON TOGETHER */}
                 <div className="flex items-center gap-3">
                   <JobStatusBadge status={job?.status ?? "pending"} />
-                  
+                  <Button 
+                    variant="outline" 
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={() => setCurrentJobId(null)}
+                    title="Clear this view to start a new job. This job will continue in the background."
+                  >
+                    New Job
+                  </Button>
+
                   {/* ONLY SHOW CANCEL BUTTON IF IT IS PENDING OR PROCESSING */}
                   {(job?.status === "pending" || job?.status === "processing") && (
                     <Button 
@@ -224,7 +233,6 @@ export default function Extend() {
                       onClick={async () => {
                         try {
                           await fetch(`/api/jobs/${currentJobId}/cancel`, { method: "POST" });
-                          // Force React Query to immediately refresh the UI
                           queryClient.invalidateQueries({ queryKey: getGetJobQueryKey(currentJobId as number) });
                           queryClient.invalidateQueries({ queryKey: getListJobsQueryKey() });
                         } catch (e) {
@@ -236,7 +244,6 @@ export default function Extend() {
                     </Button>
                   )}
                 </div>
-
               </div>
             </CardHeader>
             <CardContent className="pt-6 space-y-6">
@@ -247,7 +254,7 @@ export default function Extend() {
                   <div className="space-y-4">
                     <div className="flex items-center justify-between text-sm">
                       <span className="text-muted-foreground">File</span>
-                      <span className="font-medium truncate max-w-[200px]" title={job.inputFilename}>{job.inputFilename}</span>
+                      <InlineEdit jobId={job.id} initialValue={job.inputFilename} />
                     </div>
                     {job.barsToExtend && (
                       <div className="flex items-center justify-between text-sm">

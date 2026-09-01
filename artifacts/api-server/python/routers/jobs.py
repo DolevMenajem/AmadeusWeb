@@ -15,6 +15,8 @@ from ..lib.db import get_conn
 from ..lib.midi_gen import generate_output_midi, extract_midi_features, UPLOADS_DIR
 from ..lib.gemini import generate_lecturer_feedback
 
+
+
 # --- TRI BRAIN IMPORT ---
 from ..models.composer_engine import AmadeusComposerREMI, AmadeusComposerOctuple, AmadeusComposerTSD
 
@@ -432,3 +434,26 @@ def cancel_job(job_id: int):
         task.cancel()
 
     return {"message": f"Job {job_id} cancelled"}
+
+from pydantic import BaseModel
+
+class RenameJobRequest(BaseModel):
+    newFilename: str
+
+@router.patch("/jobs/{job_id}/rename")
+def rename_job(job_id: int, body: RenameJobRequest):
+    """Updates the input_filename (used as the display name) for a specific job."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # First check if it exists
+            cur.execute("SELECT id FROM jobs WHERE id = %s", (job_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Job not found")
+                
+            # Perform the update
+            cur.execute(
+                "UPDATE jobs SET input_filename = %s WHERE id = %s", 
+                (body.newFilename, job_id)
+            )
+            
+    return {"message": "Job renamed successfully", "new_filename": body.newFilename}

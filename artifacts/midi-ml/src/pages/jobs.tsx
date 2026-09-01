@@ -9,6 +9,7 @@ import { Download, PlayCircle, Activity, FolderOpen } from "lucide-react";
 import { useState } from "react";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 import { Link, useLocation } from "wouter";
+import { InlineEdit } from "@/components/inline-edit";
 
 function DownloadCell({ jobId, status, isLocal }: { jobId: number | string, status: string, isLocal?: boolean }) {
   const [downloading, setDownloading] = useState(false);
@@ -183,7 +184,11 @@ export default function Jobs() {
                         </Badge>
                       </TableCell>
                       <TableCell className={`font-medium ${job.isLocal ? "text-primary" : ""}`}>
-                        {job.inputFilename}
+                        {job.isLocal ? (
+                          job.inputFilename
+                        ) : (
+                          <InlineEdit jobId={job.id} initialValue={job.inputFilename} />
+                        )}
                       </TableCell>
                       <TableCell>
                         {job.isLocal ? (
