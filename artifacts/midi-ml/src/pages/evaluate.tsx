@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   useEvaluateMidi,
   useUploadMidiFile,
@@ -8,21 +9,26 @@ import {
   getGetJobQueryKey,
   useListJobs
 } from "@workspace/api-client-react";
-import { useQueryClient } from "@tanstack/react-query";
+
+// UI Components
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { useToast } from "@/hooks/use-toast";
-import { JobStatusBadge } from "@/components/job-status-badge";
 import { Progress } from "@/components/ui/progress";
+import { JobStatusBadge } from "@/components/job-status-badge";
 import { MidiFileUpload } from "@/components/midi-file-upload";
-import { GraduationCap, Music2, Cpu, BarChart3, Target } from "lucide-react";
-import { Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, Tooltip } from 'recharts';
-import { useLocalStorage } from "@/hooks/use-local-storage";
 import { InlineEdit } from "@/components/inline-edit";
+import { Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, Tooltip } from 'recharts';
+
+// Hooks & Icons
+import { useToast } from "@/hooks/use-toast";
+import { useLocalStorage } from "@/hooks/use-local-storage";
+import { GraduationCap, Cpu, Target, FileMusic, Sparkles, BookOpen } from "lucide-react";
 
 export default function Evaluate() {
-  const [currentJobId, setCurrentJobId] = useLocalStorage<number | null>("amadeus_evaluate_job_id", null);  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  // --- STATE MANAGEMENT ---
+  const [currentJobId, setCurrentJobId] = useLocalStorage<number | null>("amadeus_evaluate_job_id", null); 
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [targetGenre, setTargetGenre] = useState<string>("");
   const [formError, setFormError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"Theory & Harmony" | "Rhythm & Groove" | "Genre Accuracy">("Theory & Harmony");
@@ -30,6 +36,7 @@ export default function Evaluate() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
 
+  // --- API QUERIES & MUTATIONS ---
   const { data: allJobs } = useListJobs();
   const evaluationHistory = allJobs?.filter((j: any) => j.type === "evaluate" && j.status === "completed") || [];
 
@@ -60,6 +67,7 @@ export default function Evaluate() {
     },
   });
 
+  // --- SUBMIT HANDLER ---
   const handleSubmit = () => {
     if (!targetGenre.trim()) { setFormError("Please specify your target genre."); return; }
     if (!selectedFile) { setFormError("Please select a MIDI file."); return; }
@@ -69,7 +77,6 @@ export default function Evaluate() {
       { data: { file: selectedFile } },
       {
         onSuccess: (upload) => {
-          // Send both the filename and the new target genre to the backend
           evaluateMutation.mutate({ 
             data: { 
               inputFilename: upload.filename, 
@@ -87,23 +94,20 @@ export default function Evaluate() {
   const isPending = uploadMutation.isPending || evaluateMutation.isPending;
   const result = job?.evaluationResult as any;
 
-  const ScoreBar = ({ label, score }: { label: string; score?: number }) => (
-    <div className="space-y-1.5" data-testid={`score-${label.toLowerCase()}`}>
-      <div className="flex justify-between text-sm">
-        <span className="text-muted-foreground">{label}</span>
-        <span className="font-mono font-semibold text-foreground">{score !== undefined ? `${score}/100` : "—"}</span>
-      </div>
-      <Progress value={score ?? 0} className="h-1.5" />
-    </div>
-  );
-
+  // --- RENDER ---
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+      
+      {/* Page Header */}
       <div>
         <div className="flex items-center gap-3">
-          <h1 className="text-3xl font-bold tracking-tight text-foreground">Evaluate &amp; Feedback</h1>
-          <div className="bg-violet-500/20 text-violet-400 px-2 py-1 rounded text-xs font-bold tracking-widest flex items-center gap-1">
-            <GraduationCap className="w-3 h-3" /> AI LECTURER
+          <h1 className="text-3xl font-bold tracking-tight text-foreground flex items-center gap-3">
+            Evaluate &amp; Feedback
+            <GraduationCap className="w-8 h-8 text-violet-500 opacity-80" />
+          </h1>
+          {/* VISUALS: Enhanced the AI Lecturer badge for better contrast */}
+          <div className="bg-violet-500/20 border border-violet-500/30 text-violet-400 px-2 py-1 rounded-md text-xs font-bold tracking-widest flex items-center gap-1.5 shadow-sm">
+            <Sparkles className="w-3 h-3" /> AI LECTURER
           </div>
         </div>
         <p className="text-muted-foreground mt-2">
@@ -111,29 +115,37 @@ export default function Evaluate() {
         </p>
       </div>
 
- <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        {/* LEFT COLUMN WRAPPER */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        
+        {/* LEFT COLUMN: Inputs & History */}
         <div className="space-y-6">
-          <Card className="bg-card border-border h-fit">
+          
+          {/* Submit Card */}
+          <Card className="bg-gradient-to-br from-card to-background/50 border-border shadow-md shadow-black/20 h-fit">
             <CardHeader>
-              <CardTitle>Submit for Analysis</CardTitle>
+              <CardTitle className="flex items-center gap-2"><BookOpen className="w-5 h-5 text-violet-400" /> Submit for Analysis</CardTitle>
               <CardDescription>The Lecturer evaluates your execution against your explicit intent.</CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
               
-              <div className="space-y-4">
+              <div className="space-y-5">
+                {/* Genre Input */}
                 <div className="space-y-2">
-                  <label className="text-sm font-medium leading-none">Target Genre / Style</label>
+                  <label className="text-sm font-semibold flex items-center gap-2">Target Genre / Style</label>
                   <Input 
                     placeholder="e.g., Cinematic Sci-Fi, Bebop Jazz, Classical Piano..." 
                     value={targetGenre}
                     onChange={(e) => setTargetGenre(e.target.value)}
                     disabled={isPending}
+                    className="bg-background/50 backdrop-blur-sm border-input transition-colors focus:border-violet-500"
                   />
                 </div>
 
-                <div className="space-y-2">
-                  <label className="text-sm font-medium leading-none">MIDI File</label>
+                {/* File Upload Dropzone */}
+                <div className="space-y-2 p-4 bg-secondary/10 border border-border rounded-lg transition-colors hover:bg-secondary/20">
+                  <label className="text-sm font-semibold flex items-center gap-2">
+                    <FileMusic className="w-4 h-4 text-violet-400" /> MIDI File
+                  </label>
                   <MidiFileUpload
                     selectedFile={selectedFile}
                     onFileSelect={(f) => { setSelectedFile(f); setFormError(null); }}
@@ -144,60 +156,68 @@ export default function Evaluate() {
 
               {formError && <p className="text-sm font-medium text-destructive">{formError}</p>}
               
-              <Button onClick={handleSubmit} disabled={isPending} className="w-full" data-testid="button-submit">
-                {uploadMutation.isPending ? "Uploading..." : evaluateMutation.isPending ? "Submitting..." : "Evaluate Composition"}
+              {/* Submit Button */}
+              <Button 
+                onClick={handleSubmit} 
+                disabled={isPending} 
+                className="w-full h-12 text-md shadow-md shadow-violet-500/20 hover:shadow-violet-500/40 hover:bg-violet-600 transition-all gap-2 bg-violet-500 text-white" 
+                data-testid="button-submit"
+              >
+                {uploadMutation.isPending ? "Uploading..." : evaluateMutation.isPending ? "Submitting..." : <><GraduationCap className="w-5 h-5" /> Evaluate Composition</>}
               </Button>
 
-              <div className="space-y-2 text-xs text-muted-foreground border-t border-border pt-4">
-                <p className="font-medium text-foreground text-sm">What happens</p>
+              {/* Informational Block */}
+              <div className="space-y-3 p-4 bg-secondary/20 rounded-lg border border-border/50 text-xs text-muted-foreground mt-4">
+                <p className="font-semibold text-foreground text-sm flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-violet-400" /> Analysis Pipeline
+                </p>
                 <div className="flex items-start gap-2">
-                  <Target className="w-3 h-3 mt-0.5 shrink-0 text-primary" />
-                  <span>Your target genre anchors the evaluation context</span>
+                  <Target className="w-3.5 h-3.5 mt-0.5 shrink-0 text-violet-400" />
+                  <span>Your target genre anchors the evaluation context.</span>
                 </div>
                 <div className="flex items-start gap-2">
-                  <Cpu className="w-3 h-3 mt-0.5 shrink-0 text-primary" />
-                  <span>Local feature extraction — polyphony, velocity variance, pitch range</span>
+                  <Cpu className="w-3.5 h-3.5 mt-0.5 shrink-0 text-violet-400" />
+                  <span>Local feature extraction — polyphony, velocity variance, pitch range.</span>
                 </div>
                 <div className="flex items-start gap-2">
-                  <GraduationCap className="w-3 h-3 mt-0.5 shrink-0 text-violet-400" />
-                  <span>Gemini generates feedback based on how well the math aligns with your intent</span>
+                  <GraduationCap className="w-3.5 h-3.5 mt-0.5 shrink-0 text-violet-400" />
+                  <span>Gemini generates feedback based on how well the math aligns with your intent.</span>
                 </div>
               </div>
+
             </CardContent>
           </Card>
 
-          {/* NEW: Evaluation History Card */}
-          <Card className="bg-card border-border h-fit">
-            <CardHeader>
+          {/* History Card */}
+          <Card className="bg-gradient-to-br from-card to-background/50 border-border shadow-md shadow-black/20 h-fit">
+            <CardHeader className="pb-3 border-b border-border bg-secondary/5 rounded-t-xl">
               <CardTitle className="text-lg">Evaluation History</CardTitle>
               <CardDescription>Click to instantly load a past analysis.</CardDescription>
             </CardHeader>
-            <CardContent>
-              <div className="space-y-2 max-h-[300px] overflow-y-auto pr-2">
+            <CardContent className="pt-4">
+              <div className="space-y-2 max-h-[250px] overflow-y-auto pr-2 custom-scrollbar">
                 {evaluationHistory.length === 0 ? (
-                  <p className="text-sm text-muted-foreground">No past evaluations found.</p>
+                  <p className="text-sm text-muted-foreground text-center py-4">No past evaluations found.</p>
                 ) : (
                   evaluationHistory.map((pastJob: any) => (
                     <div 
                       key={pastJob.id}
-                      className={`w-full flex items-center justify-between p-2 rounded-md border text-sm transition-colors ${
+                      className={`w-full flex items-center justify-between p-2 rounded-md border text-sm transition-all ${
                         currentJobId === pastJob.id 
-                          ? "bg-primary text-primary-foreground border-primary" 
-                          : "bg-background border-input hover:bg-accent hover:text-accent-foreground"
+                          ? "bg-violet-500/20 text-violet-100 border-violet-500/50 shadow-sm shadow-violet-500/10" 
+                          : "bg-background/50 border-input hover:bg-secondary/40 hover:border-border cursor-pointer"
                       }`}
+                      onClick={(e) => {
+                        // Prevent row click if they are interacting with the InlineEdit
+                        if ((e.target as HTMLElement).closest('.inline-edit-container')) return;
+                        setCurrentJobId(pastJob.id);
+                      }}
                     >
-                      {/* Clicking the container selects the job */}
-                      <div 
-                        className="truncate flex-1 flex items-center gap-2 cursor-pointer" 
-                        onClick={() => setCurrentJobId(pastJob.id)}
-                      >
+                      <div className="truncate flex-1 flex items-center gap-2 inline-edit-container">
                         <InlineEdit jobId={pastJob.id} initialValue={pastJob.inputFilename} />
                       </div>
                       
-                      <span 
-                        className="ml-2 text-xs opacity-50 shrink-0 cursor-pointer"
-                        onClick={() => setCurrentJobId(pastJob.id)}
-                      >
+                      <span className="ml-2 text-xs font-medium opacity-60 shrink-0 bg-background/50 px-2 py-0.5 rounded">
                         {pastJob.targetGenre || "General"}
                       </span>
                     </div>
@@ -207,30 +227,28 @@ export default function Evaluate() {
             </CardContent>
           </Card>
         </div>
-        {/* END LEFT COLUMN WRAPPER */}
 
+        {/* RIGHT COLUMN: Results Display */}
         {currentJobId && (
           <div className="space-y-6">
-            <Card className="bg-card border-border">
-              <CardHeader className="pb-3 border-b border-border">
+            <Card className="bg-gradient-to-br from-card to-background/50 border-violet-500/30 shadow-lg shadow-violet-500/10 h-fit ring-1 ring-violet-500/20 animate-in fade-in slide-in-from-right-4">
+              <CardHeader className="pb-3 border-b border-border bg-secondary/10 rounded-t-xl">
                 <div className="flex items-center justify-between">
-                  <CardTitle>Analysis Report</CardTitle>
+                  <CardTitle className="flex items-center gap-2"><Target className="w-5 h-5 text-violet-400" /> Analysis Report</CardTitle>
                   
                   <div className="flex items-center gap-3">
                     <JobStatusBadge status={job?.status ?? "pending"} />
                     
-                    {/* NEW: Background / Clear Button */}
                     <Button 
                       variant="outline" 
                       size="sm"
-                      className="h-7 text-xs"
+                      className="h-7 text-xs bg-background/50 hover:bg-background"
                       onClick={() => setCurrentJobId(null)}
                       title="Clear this view to start a new job. This job will continue in the background."
                     >
                       New Job
                     </Button>
 
-                    {/* ONLY SHOW CANCEL BUTTON IF IT IS PENDING OR PROCESSING */}
                     {(job?.status === "pending" || job?.status === "processing") && (
                       <Button 
                         variant="destructive" 
@@ -252,39 +270,48 @@ export default function Evaluate() {
                   </div>
                 </div>
               </CardHeader>
+              
               <CardContent className="pt-6 space-y-8">
+                
+                {/* Loading State */}
                 {!job ? (
-                  <div className="text-sm text-muted-foreground">Loading...</div>
+                  <div className="text-sm text-muted-foreground flex items-center justify-center py-12">Loading analysis data...</div>
                 ) : job.status === "failed" ? (
-                  <div className="p-3 text-sm text-red-500 bg-red-500/10 rounded-md border border-red-500/20">
+                  <div className="p-4 text-sm text-destructive bg-destructive/10 rounded-md border border-destructive/20 flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-destructive animate-pulse" />
                     {job.errorMessage ?? "Analysis failed."}
                   </div>
                 ) : job.status === "completed" && result ? (
                   <div className="space-y-8 animate-in fade-in duration-700">
 
-                    {/* Overall score & Radar Chart */}
+                    {/* Overall Score & Radar Chart */}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      
+                      {/* Score Boxes */}
                       <div className="flex flex-col gap-4">
-                        <div className="p-4 bg-primary/10 border border-primary/20 rounded-lg text-center flex-1 flex flex-col justify-center">
-                          <div className="text-xs text-primary uppercase tracking-wider font-medium mb-1">Overall Score</div>
-                          <div className="text-5xl font-bold text-primary tracking-tighter" data-testid="score-overall">
+                        <div className="p-6 bg-gradient-to-br from-violet-500/20 to-violet-500/5 border border-violet-500/30 rounded-lg text-center flex-1 flex flex-col justify-center shadow-inner">
+                          <div className="text-xs text-violet-400 uppercase tracking-widest font-bold mb-2">Overall Score</div>
+                          <div className="text-6xl font-black text-violet-100 tracking-tighter drop-shadow-md" data-testid="score-overall">
                             {result.overallScore}
                           </div>
                         </div>
                         {result.predictedGenre && (
-                          <div className="p-4 bg-violet-500/10 border border-violet-500/20 rounded-lg text-center">
-                            <div className="text-xs text-violet-400 uppercase tracking-wider font-medium mb-1">Target Style</div>
-                            <div className="text-xl font-bold text-violet-300 mt-1 line-clamp-2">{result.predictedGenre}</div>
+                          <div className="p-4 bg-secondary/30 border border-border/50 rounded-lg text-center shadow-sm">
+                            <div className="text-xs text-muted-foreground uppercase tracking-widest font-semibold mb-1">Target Style</div>
+                            <div className="text-lg font-bold text-foreground mt-1 line-clamp-2">{result.predictedGenre}</div>
                           </div>
                         )}
                       </div>
 
-                     <div className="h-[250px] w-full bg-secondary/10 border border-border rounded-lg p-2 flex items-center justify-center">
-                        <ResponsiveContainer width="100%" height="100%">
+                      {/* Radar Chart */}
+                      <div className="h-[250px] w-full bg-black/40 border border-border/50 rounded-lg p-2 flex items-center justify-center shadow-inner relative overflow-hidden">
+                        {/* Decorative background glow for the chart */}
+                        <div className="absolute inset-0 bg-violet-500/5 rounded-lg pointer-events-none blur-xl"></div>
+                        <ResponsiveContainer width="100%" height="100%" className="relative z-10">
                           <RadarChart 
                             cx="50%"
                             cy="50%"
-                            outerRadius="55%"
+                            outerRadius="60%"
                             data={[
                               { subject: 'Theory', score: result.theoryScore || 0, fullMark: 100 },
                               { subject: 'Rhythm', score: result.rhythmScore || 0, fullMark: 100 },
@@ -292,23 +319,26 @@ export default function Evaluate() {
                               { subject: 'Overall', score: result.overallScore || 0, fullMark: 100 }
                             ]}
                           >
-                            <PolarGrid stroke="rgba(255,255,255,0.1)" />
-                            <PolarAngleAxis dataKey="subject" tick={{ fill: 'rgba(255,255,255,0.6)', fontSize: 12 }} />
+                            <PolarGrid stroke="rgba(139, 92, 246, 0.2)" />
+                            <PolarAngleAxis dataKey="subject" tick={{ fill: 'rgba(255,255,255,0.7)', fontSize: 11, fontWeight: 600 }} />
                             <PolarRadiusAxis angle={30} domain={[0, 100]} tick={false} axisLine={false} />
-                            <Radar name="Score" dataKey="score" stroke="#8b5cf6" fill="#8b5cf6" fillOpacity={0.4} />
-                            <Tooltip contentStyle={{ backgroundColor: '#18181b', borderColor: '#27272a' }} itemStyle={{ color: '#a78bfa' }} />
+                            <Radar name="Score" dataKey="score" stroke="#8b5cf6" strokeWidth={2} fill="#8b5cf6" fillOpacity={0.4} />
+                            <Tooltip 
+                              contentStyle={{ backgroundColor: '#18181b', borderColor: '#8b5cf6', borderRadius: '8px', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.5)' }} 
+                              itemStyle={{ color: '#c4b5fd', fontWeight: 'bold' }} 
+                            />
                           </RadarChart>
                         </ResponsiveContainer>
                       </div>
                     </div>
 
-                    {/* MIDI features */}
+                    {/* MIDI Features */}
                     {result.midiFeatures && (
-                      <div className="space-y-2">
-                        <h4 className="text-sm font-medium border-b border-border pb-2 flex items-center gap-2">
-                          <Cpu className="w-3.5 h-3.5 text-primary" /> Extracted Features
+                      <div className="space-y-3 bg-secondary/10 p-4 rounded-lg border border-border/50">
+                        <h4 className="text-sm font-semibold border-b border-border/50 pb-2 flex items-center gap-2">
+                          <Cpu className="w-4 h-4 text-violet-400" /> Extracted Mathematical Features
                         </h4>
-                        <div className="grid grid-cols-2 gap-2 text-sm">
+                        <div className="grid grid-cols-2 gap-3 text-sm pt-1">
                           {[
                             ["Tempo", `${result.midiFeatures.estimatedTempo} BPM`],
                             ["Polyphony (Max)", result.midiFeatures.maxPolyphony],
@@ -317,68 +347,81 @@ export default function Evaluate() {
                             ["Pitch Range", `${result.midiFeatures.pitchRange} steps`],
                             ["Duration", `${result.midiFeatures.durationSeconds}s`],
                           ].map(([label, val]) => (
-                            <div key={label as string} className="flex justify-between bg-secondary/30 rounded px-3 py-2">
-                              <span className="text-muted-foreground">{label}</span>
-                              <span className="font-mono font-medium">{val}</span>
+                            <div key={label as string} className="flex justify-between items-center bg-background/50 rounded-md px-3 py-2 border border-border/30">
+                              <span className="text-muted-foreground text-xs">{label}</span>
+                              <span className="font-mono font-semibold text-violet-100">{val}</span>
                             </div>
                           ))}
                         </div>
                       </div>
                     )}
 
-                    {/* Lecturer feedback - Multi-Lens Carousel */}
+                    {/* Lecturer Feedback - Multi-Lens Carousel */}
                     {result.lecturerFeedback && typeof result.lecturerFeedback === 'object' && (
                       <div className="space-y-4">
-                        <div className="flex gap-2 border-b border-border pb-2">
+                        
+                        {/* Tab Navigation */}
+                        <div className="flex gap-2 border-b border-border/50 pb-3 overflow-x-auto custom-scrollbar">
                           {["Theory & Harmony", "Rhythm & Groove", "Genre Accuracy"].map((tab) => (
                             <Button
                               key={tab}
                               variant={activeTab === tab ? "default" : "ghost"}
                               size="sm"
                               onClick={() => setActiveTab(tab as any)}
-                              className={activeTab === tab ? "bg-violet-500 text-white hover:bg-violet-600" : "text-muted-foreground"}
+                              className={`transition-all whitespace-nowrap ${
+                                activeTab === tab 
+                                  ? "bg-violet-500 text-white shadow-md shadow-violet-500/20" 
+                                  : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
+                              }`}
                             >
                               {tab}
                             </Button>
                           ))}
                         </div>
 
-                        <div className="p-4 bg-violet-500/8 border border-violet-500/20 rounded-lg relative min-h-[120px]">
-                          <div className="absolute top-3 left-3 text-violet-300 opacity-30 text-4xl font-serif leading-none">"</div>
-                          <p className="text-sm text-foreground leading-relaxed pl-4 italic">
+                        {/* Feedback Quote Block */}
+                        <div className="p-5 bg-gradient-to-br from-violet-900/20 to-transparent border border-violet-500/20 rounded-xl relative min-h-[140px] shadow-inner">
+                          <div className="absolute top-4 left-4 text-violet-500/20 text-6xl font-serif leading-none">"</div>
+                          <p className="text-sm text-foreground/90 leading-relaxed pl-6 pt-2 italic relative z-10">
                             {result.lecturerFeedback[activeTab] || "Analyzing this specific aspect..."}
                           </p>
-                          <div className="absolute bottom-3 right-4 text-violet-300 opacity-30 text-4xl font-serif leading-none">"</div>
+                          <div className="absolute bottom-[-10px] right-6 text-violet-500/20 text-6xl font-serif leading-none">"</div>
                         </div>
 
-                        {/* Suggestions Box (Displaying the top 3 from the pooled array) */}
+                        {/* Suggestions Box */}
                         {result.suggestions && result.suggestions.length > 0 && (
-                           <div className="mt-4 p-3 bg-secondary/30 rounded-lg border border-border">
-                             <h5 className="text-xs font-semibold uppercase tracking-wider mb-2">Key Suggestions</h5>
-                             <ul className="list-disc pl-4 space-y-1 text-sm text-muted-foreground">
+                           <div className="mt-4 p-4 bg-secondary/30 rounded-xl border border-border/50">
+                             <h5 className="text-xs font-bold uppercase tracking-widest mb-3 flex items-center gap-2 text-violet-400">
+                               <Sparkles className="w-3.5 h-3.5" /> Key Suggestions
+                             </h5>
+                             <ul className="pl-5 space-y-2 text-sm text-foreground/80 marker:text-violet-500">
                                {result.suggestions.slice(0, 3).map((suggestion: string, idx: number) => (
-                                 <li key={idx}>{suggestion}</li>
+                                 <li key={idx} className="leading-relaxed">{suggestion}</li>
                                ))}
                              </ul>
                            </div>
                         )}
 
-                        <p className="text-xs text-muted-foreground flex items-center gap-1.5 pt-2">
-                          <span className="w-2 h-2 rounded-full bg-violet-400 inline-block" />
-                          Generated concurrently by Gemini · Amadeus AI Lecturer
+                        {/* Footer Watermark */}
+                        <p className="text-xs text-muted-foreground flex items-center justify-end gap-1.5 pt-4">
+                          <span className="w-2 h-2 rounded-full bg-violet-500 inline-block animate-pulse" />
+                          Generated by Gemini 2.5 Flash · Amadeus Evaluator
                         </p>
                       </div>
                     )}
 
                   </div>
                 ) : (
-                  <div className="py-8 flex flex-col items-center justify-center text-muted-foreground gap-4">
-                    <div className="w-8 h-8 rounded-full border-2 border-primary border-t-transparent animate-spin" />
+                  <div className="py-16 flex flex-col items-center justify-center text-muted-foreground gap-5">
+                    <div className="relative flex items-center justify-center">
+                      <div className="absolute w-12 h-12 rounded-full border-4 border-violet-500/20"></div>
+                      <div className="w-12 h-12 rounded-full border-4 border-violet-500 border-t-transparent animate-spin"></div>
+                    </div>
                     <div className="text-center">
-                      <p className="text-sm font-medium text-foreground">
-                        {job.status === "pending" ? "Queued..." : "Analysing your composition..."}
+                      <p className="text-sm font-semibold text-foreground">
+                        {job.status === "pending" ? "Queued in processing pipeline..." : "Lecturer is analysing your composition..."}
                       </p>
-                      <p className="text-xs mt-1">Extracting features → Generating feedback</p>
+                      <p className="text-xs mt-1.5 opacity-70">Extracting features → Generating feedback</p>
                     </div>
                   </div>
                 )}
