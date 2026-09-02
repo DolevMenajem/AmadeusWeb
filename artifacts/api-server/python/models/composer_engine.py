@@ -16,16 +16,20 @@ from .jam_inference import JamModel
 # ─── SHARED UTILITIES FOR MULTI-TRACK ────────────────────────────────────────
 
 def _rescale_score_inplace(score, dst_tpq):
+    # Adjusts the Ticks Per Quarter (TPQ) resolution of a MIDI score.
+    # ML models often require a specific grid resolution (e.g., 480 TPQ).
     if score.tpq == dst_tpq: return score
     scale = dst_tpq / score.tpq
     for tr in score.tracks:
         for n in tr.notes:
+            # Scale the start time and duration by the resolution ratio
             n.time = int(round(n.time * scale))
             n.duration = max(1, int(round(n.duration * scale)))
     score.tpq = dst_tpq
     return score
 
 class Attention(nn.Module):
+    # Standard Multi-Head Self-Attention wrapper used by the Octuple hybrid model.
     def __init__(self, hidden_dim, num_heads=8, dropout=0.0):
         super().__init__()
         self.mha = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
@@ -33,14 +37,18 @@ class Attention(nn.Module):
 
     def forward(self, x):
         seq_len = x.size(1)
+        # Create a causal mask (upper triangular) to prevent the model from looking into the future
         causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
         attn_out, _ = self.mha(query=x, key=x, value=x, attn_mask=causal_mask, need_weights=False)
+        # Add residual connection and apply layer normalization
         return self.norm(x + attn_out)
 
 # ─── 1. UPGRADED REMI MODEL (BIFG GPT via JamModel) ─────────────────────────
 
 class AmadeusComposerREMI:
+    # Wrapper for the primary Single-Track model, leaning on an external JamModel architecture
     def __init__(self, checkpoint_path, tokenizer_path):
+        # Dynamically assigns processing to GPU if available to speed up matrix multiplication
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Loading Upgraded REMI JamModel from {checkpoint_path} on {self.device}...")
         self.jam = JamModel(
@@ -51,6 +59,7 @@ class AmadeusComposerREMI:
 
     def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0):
         try:
+            # Convert token count to approximate musical bars (assuming ~32 tokens per bar)
             bars_to_extend = max(1, num_generate // 32)
             temp = temperature if temperature is not None else 0.8
             p = top_p if top_p is not None else 0.9
@@ -58,6 +67,7 @@ class AmadeusComposerREMI:
             print(f"[REMI] Continuing song for {bars_to_extend} bars...")
 
             # Generate full extended score (prompt + extension)
+            # include_prompt=True stitches the original input to the new generation
             full_score, info = self.jam.continue_song(
                 midi=str(input_midi_path),
                 n_bars=bars_to_extend,
@@ -68,6 +78,7 @@ class AmadeusComposerREMI:
             )
 
             # Generate isolated extension only (without prompt)
+            # include_prompt=False returns ONLY the AI's continuation
             ext_score, _ = self.jam.continue_song(
                 midi=str(input_midi_path),
                 n_bars=bars_to_extend,
@@ -77,20 +88,23 @@ class AmadeusComposerREMI:
                 progress=False
             )
 
+            # Prepare file output paths
             base_path_str = str(output_midi_path).replace(".mid", "")
             full_path = f"{base_path_str}_full.mid"
             ext_path = f"{base_path_str}_extension.mid"
             wav_path = f"{base_path_str}.wav"
 
-            # Save MIDI files
+            # Save MIDI files to disk
             full_score.dump_midi(full_path)
             ext_score.dump_midi(ext_path)
             full_score.dump_midi(str(output_midi_path))
 
             # Render Audio with FluidSynth
+            # Uses a standard General MIDI (GM) SoundFont to synthesize audio
             soundfont = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
             if os.path.exists(soundfont):
                 try:
+                    # Executes the FluidSynth CLI tool as a subprocess to render a 44.1kHz WAV
                     subprocess.run(
                         ["fluidsynth", "-ni", soundfont, full_path, "-F", wav_path, "-r", "44100"],
                         check=True,
@@ -112,36 +126,51 @@ class AmadeusComposerREMI:
 # ─── 2. NEW MULTI-TRACK MODEL (OCTUPLE) ───────────────────────────────────────
 
 class ComposerMidiOctuple(nn.Module):
+    # Hybrid LSTM + Attention architecture designed specifically for the Octuple tokenization strategy
+    # Octuple uses multi-dimensional tokens (pitch, velocity, duration, etc. are passed simultaneously)
     def __init__(self, sub_vocab_sizes, embed_size, hidden_size, num_layers=2, num_heads=8, dropout=0.1):
         super().__init__()
         self.sub_vocab_sizes = list(sub_vocab_sizes)
-        self.num_streams = len(self.sub_vocab_sizes)
+        self.num_streams = len(self.sub_vocab_sizes) # Number of independent token streams (e.g., 8 for Octuple)
+        
+        # Create an independent embedding layer for each stream in the token tuple
         self.embeddings = nn.ModuleList([nn.Embedding(v, embed_size) for v in self.sub_vocab_sizes])
         self.embed_dropout = nn.Dropout(dropout)
+        
+        # Core sequence modeling: RNN (LSTM) handles local time, Attention handles global context
         self.lstm = nn.LSTM(embed_size, hidden_size, num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
         self.attention = Attention(hidden_size, num_heads=num_heads, dropout=dropout)
+        
+        # Output heads: Decodes the hidden state back into probabilities for EACH stream independently
         self.heads = nn.ModuleList([nn.Linear(hidden_size, v) for v in self.sub_vocab_sizes])
 
     def forward(self, x, hidden=None):
+        # x shape: [Batch, Sequence_Length, Streams]
+        # Sum the embeddings of all streams together to create a unified token representation
         embedded = self.embeddings[0](x[..., 0])
         for s in range(1, self.num_streams):
             embedded = embedded + self.embeddings[s](x[..., s])
+            
         embedded = self.embed_dropout(embedded)
         lstm_out, hidden = self.lstm(embedded, hidden)
         attended = self.attention(lstm_out)
+        
+        # Generate independent predictions for each part of the Octuple tuple
         logits = [head(attended) for head in self.heads]
         return logits, hidden
 
 class AmadeusComposerOctuple:
     def __init__(self, checkpoint_path, tokenizer_path):
-        self.device = torch.device("cpu")
-        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")    
+
+        # Setup MidiTok Octuple tokenizer
         target_path = Path(tokenizer_path).parent / "Compose_Octuple.json"
         if target_path.exists():
             self.tokenizer = Octuple(params=target_path)
         else:
             self.tokenizer = Octuple(params=Path(tokenizer_path))
             
+        # Load weights and extract configuration metadata
         ckpt = torch.load(checkpoint_path, map_location=self.device)
         cfg = ckpt["config"]
         self.seq_len = cfg["seq_len"]
@@ -149,9 +178,13 @@ class AmadeusComposerOctuple:
         self.sub_vocab_sizes = [len(v) for v in self.tokenizer.vocab]
         self.num_streams = len(self.sub_vocab_sizes)
         
+        # Identify the specific index for 'Bar' tokens. 
+        # This is critical to prevent the model from generating infinitely into the future.
         self.bar_stream_idx = self.tokenizer.vocab_types_idx.get("Bar", 2)
         bar_vocab = self.tokenizer.vocab[self.bar_stream_idx]
         self.bar_values = torch.full((len(bar_vocab),), -1, dtype=torch.long, device=self.device)
+        
+        # Extract integer values from Bar tokens (e.g., "Bar_5" -> 5)
         for tok_str, tid in bar_vocab.items():
             parts = tok_str.split("_", 1)
             if len(parts) == 2:
@@ -166,41 +199,53 @@ class AmadeusComposerOctuple:
         self.model.eval()
 
     def _sample_one_stream(self, logits_1d, temperature, top_k, top_p):
+        # Applies temperature scaling to flatten or sharpen the probability distribution
         temperature = temperature or 0.8
         logits_1d = logits_1d / max(temperature, 1e-8)
+        
+        # Top-K Sampling: Zero out all probabilities outside the top K highest values
         if top_k and top_k > 0:
             k = min(top_k, logits_1d.size(-1))
             v, _ = torch.topk(logits_1d, k)
             logits_1d = logits_1d.clone()
             logits_1d[logits_1d < v[-1]] = -float("inf")
+            
+        # Nucleus (Top-P) Sampling: Filter out tokens whose cumulative probability exceeds P
         if top_p and 0 < top_p < 1.0:
             sorted_logits, sorted_idx = torch.sort(logits_1d, descending=True)
             cum = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
             remove = cum > top_p
-            remove[1:] = remove[:-1].clone()
+            remove[1:] = remove[:-1].clone() # Shift mask to keep the token that crosses the threshold
             remove[0] = False
             sorted_logits[remove] = -float("inf")
             logits_1d = torch.full_like(logits_1d, -float("inf"))
             logits_1d.scatter_(0, sorted_idx, sorted_logits)
+            
+        # Convert filtered logits to probabilities and sample a single token
         probs = F.softmax(logits_1d, dim=-1)
         return int(torch.multinomial(probs, num_samples=1))
 
     @torch.no_grad()
     def _generate_tokens(self, prompt_ids, num_tokens, temperature, top_k, top_p, max_bar_window=2):
+        # Auto-regressive generation loop for multidimensional tokens
         seq = torch.tensor([list(t) for t in prompt_ids], dtype=torch.long, device=self.device)
         
+        # Determine the starting measure (Bar) so we can control how far ahead we generate
         prompt_bar_vals = self.bar_values[seq[:, self.bar_stream_idx]]
         valid = prompt_bar_vals >= 0
         max_bar = int(prompt_bar_vals[valid].max()) if valid.any() else 0
         
         for _ in range(num_tokens):
+            # Feed the last N tokens into the model (context window)
             context = seq[-self.seq_len:].unsqueeze(0)
             logits, _ = self.model(context)
             
             next_tuple = []
+            # Sample each stream (Pitch, Velocity, Bar, etc.) one by one
             for s in range(self.num_streams):
                 next_logits = logits[s][0, -1].float().clone()
                 
+                # Hard constraint: Prevent generating a Bar token that exceeds our window
                 if s == self.bar_stream_idx:
                     threshold = max_bar + max_bar_window
                     too_far = self.bar_values > threshold
@@ -209,24 +254,30 @@ class AmadeusComposerOctuple:
                 next_id = self._sample_one_stream(next_logits, temperature, top_k, top_p)
                 next_tuple.append(next_id)
                 
+                # Update the max bar tracker if we just generated a new measure
                 if s == self.bar_stream_idx:
                     val = int(self.bar_values[next_id])
                     if val > max_bar: max_bar = val
                     
+            # Append the completed multi-dimensional token to the sequence
             seq = torch.cat([seq, torch.tensor([next_tuple], dtype=torch.long, device=self.device)], dim=0)
         return seq.tolist()
 
     def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0):
+        # Load the initial MIDI to use as a structural template
         template = Score(str(input_midi_path))
         combined = copy.deepcopy(template)
         
+        # Create an empty template that matches the input's track structure
         extension_only = copy.deepcopy(template)
         for tr in extension_only.tracks:
             tr.notes.clear()
 
+        # Iterate through every track (instrument) and extend them individually
         for i, tr in enumerate(template.tracks):
             if len(tr.notes) == 0: continue
             
+            # Isolate track and tokenize
             single = copy.deepcopy(template)
             single.tracks = [tr]
             tok_seq = self.tokenizer(single)
@@ -237,24 +288,29 @@ class AmadeusComposerOctuple:
             else:
                 ids = list(tok_seq.ids)
                 
+            # Limit the prompt to the model's context window (last 256 tokens)
             prompt = ids[-256:] 
             if not prompt: continue
             
+            # Execute inference
             full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k, top_p, max_bar_window=100)
-            cont_ids = full_ids[len(prompt):]
+            cont_ids = full_ids[len(prompt):] # Slice out the prompt, keeping only new tokens
             if not cont_ids: continue
             
             new_tok_seq = TokSequence(ids=[list(t) for t in cont_ids])
             self.tokenizer.complete_sequence(new_tok_seq)
             
             try:
+                # Convert back to symbolic MIDI data
                 cont_score = self.tokenizer.decode([new_tok_seq])
                 if not cont_score.tracks: continue
                 
+                # Synchronize Tick resolutions
                 if cont_score.tpq != combined.tpq:
                     try: cont_score = cont_score.resample(tpq=combined.tpq)
                     except: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
                 
+                # Append the newly generated notes into their respective tracks
                 for n in cont_score.tracks[0].notes:
                     t = getattr(n, 'time', None)
                     d = getattr(n, 'duration', None)
@@ -262,15 +318,19 @@ class AmadeusComposerOctuple:
                         combined.tracks[i].notes.append(n)
                         extension_only.tracks[i].notes.append(copy.deepcopy(n))
                 
+                # Sort events temporally so MIDI parsers do not break
                 combined.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
                 extension_only.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
             except Exception as e:
+                # Issue: Silently skipping a track can result in missing instruments without the user knowing
                 print(f"Skipping track due to decode error: {e}")
                 
+        # Normalize time for the extension-only output so it starts at Time=0
         min_time = min((n.time for tr in extension_only.tracks for n in tr.notes), default=0)
         for tr in extension_only.tracks:
             for n in tr.notes: n.time -= min_time
 
+        # Path Setup & Export
         base_path_str = str(output_midi_path).replace(".mid", "")
         full_path = f"{base_path_str}_full.mid"
         ext_path = f"{base_path_str}_extension.mid"
@@ -289,8 +349,10 @@ class AmadeusComposerOctuple:
         return output_midi_path
 
     def live_extend(self, notes_data, num_generate=64, temperature=0.8, bpm=120):
+        # Real-time jamming endpoint. Designed to be stateless and fast.
         print(f"\n--- [LIVE JAM] INCOMING REQUEST ---")
         
+        # 1. Create a dummy Score object to hold incoming browser data
         raw_score = Score(480) 
         raw_score.tempos.append(Tempo(time=0, qpm=bpm))
         raw_score.time_signatures.append(TimeSignature(time=0, numerator=4, denominator=4))
@@ -307,13 +369,15 @@ class AmadeusComposerOctuple:
         track.notes.sort(key=lambda n: getattr(n, 'time', 0))
         raw_score.tracks.append(track)
         
+        # 2. Write to a temporary file (Symusic requires file I/O for instantiation)
         fd, path = tempfile.mkstemp(suffix=".mid")
         os.close(fd)
         raw_score.dump_midi(path)
         
         score = Score(path)
-        os.remove(path)
+        os.remove(path) # Cleanup immediately
         
+        # 3. Tokenize input sequence
         tok_seq = self.tokenizer(score)
         ids = []
         if isinstance(tok_seq, list):
@@ -324,6 +388,7 @@ class AmadeusComposerOctuple:
         prompt = ids[-256:]
         if not prompt: return []
         
+        # 4. Generate new notes and isolate the continuation
         full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k=0, top_p=0.95, max_bar_window=100)
         cont_ids = full_ids[len(prompt):]
         if not cont_ids: return []
@@ -331,6 +396,7 @@ class AmadeusComposerOctuple:
         new_tok_seq = TokSequence(ids=[list(t) for t in cont_ids])
         self.tokenizer.complete_sequence(new_tok_seq)
         
+        # 5. Decode back to symbolic notes and format as JSON array for the frontend
         cont_score = self.tokenizer.decode([new_tok_seq])
         if not cont_score.tracks: return []
         
@@ -349,7 +415,7 @@ class AmadeusComposerOctuple:
                 n_time = getattr(n, 'time', 0)
                 response_notes.append({
                     "pitch": getattr(n, 'pitch', 60),
-                    "time": n_time - min_time, 
+                    "time": n_time - min_time, # Normalize time for instant playback
                     "duration": getattr(n, 'duration', 120),
                     "velocity": getattr(n, 'velocity', 80)
                 })
@@ -360,11 +426,13 @@ class AmadeusComposerOctuple:
 
 class _Block(nn.Module):
     """Pre-norm transformer block with causal SDPA attention."""
+    # A standard decoder-only Transformer block using modern PyTorch SDPA 
     def __init__(self, d_model, n_heads, dropout):
         super().__init__()
         self.n_heads = n_heads
         self.dropout = dropout
         self.norm1 = nn.LayerNorm(d_model)
+        # Combined Linear layer for Q, K, V to optimize memory access
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.attn_out = nn.Linear(d_model, d_model, bias=False)
         self.norm2 = nn.LayerNorm(d_model)
@@ -378,14 +446,16 @@ class _Block(nn.Module):
     def forward(self, x):
         B, L, D = x.shape
         h = self.norm1(x)
+        # Split combined QKV tensor into separate chunks
         q, k, v = self.qkv(h).chunk(3, dim=-1)
         q = q.view(B, L, self.n_heads, -1).transpose(1, 2)
         k = k.view(B, L, self.n_heads, -1).transpose(1, 2)
         v = v.view(B, L, self.n_heads, -1).transpose(1, 2)
         
+        # Uses FlashAttention algorithms under the hood when available on GPU
         a = F.scaled_dot_product_attention(
             q, k, v,
-            is_causal=True,
+            is_causal=True, # Enforces strict auto-regressive behavior
             dropout_p=self.dropout if self.training else 0.0,
         )
         a = a.transpose(1, 2).reshape(B, L, D)
@@ -394,18 +464,20 @@ class _Block(nn.Module):
         return x
 
 class ComposerGPT(nn.Module):
+    # Generative Pre-Trained Transformer tailored for 1D symbolic MIDI tokens (TSD strategy)
     def __init__(self, vocab_size, d_model=512, n_layers=8, n_heads=8, max_seq_len=1024, dropout=0.1):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.tok_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        self.pos_emb = nn.Embedding(max_seq_len, d_model) # Learned Positional Embeddings
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(_Block(d_model, n_heads, dropout) for _ in range(n_layers))
         self.norm_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
-        self.head.weight = self.tok_emb.weight  
+        self.head.weight = self.tok_emb.weight # Weight tying: shares memory between input embedding and output projection
 
         self.apply(self._init)
+        # Special initialization scale for residual paths to prevent exploding gradients
         for name, p in self.named_parameters():
             if name.endswith("attn_out.weight") or name.endswith("mlp.2.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
@@ -423,6 +495,8 @@ class ComposerGPT(nn.Module):
         B, L = x.shape
         assert L <= self.max_seq_len, f"seq_len {L} > max_seq_len {self.max_seq_len}"
         pos = torch.arange(L, device=x.device)
+        
+        # Combine Token Identity with Sequence Position
         h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
         for blk in self.blocks:
             h = blk(h)
@@ -431,13 +505,14 @@ class ComposerGPT(nn.Module):
 
 class AmadeusComposerTSD:
     def __init__(self, checkpoint_path, tokenizer_path):
-        self.device = torch.device("cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = TSD(params=Path(tokenizer_path))
         
         ckpt = torch.load(checkpoint_path, map_location=self.device)
         cfg = ckpt["config"]
         self.seq_len = cfg["seq_len"]
         
+        # Build an invalid token mask to stop the model from generating structural metadata as output
         inv = []
         bad_words = ["NONE", "PAD", "BOS", "EOS", "MASK", "UNK"]
         if isinstance(self.tokenizer.vocab, dict):
@@ -476,9 +551,11 @@ class AmadeusComposerTSD:
             logits, _ = self.model(context)
             next_logits = logits[0, -1].float()
             
+            # Mask out invalid structural tokens
             if len(inv_mask) > 0: next_logits[inv_mask] = -float("inf")
             next_logits = next_logits / max(temperature, 1e-8)
             
+            # Filtering logic for K/P sampling
             if top_k > 0:
                 indices_to_remove = next_logits < torch.topk(next_logits, top_k)[0][..., -1, None]
                 next_logits[indices_to_remove] = -float('Inf')
@@ -486,6 +563,7 @@ class AmadeusComposerTSD:
                 sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                 sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift mask logic: keeps the exact token that pushes cumulative prob over Top-P
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = 0
                 indices_to_remove = sorted_indices[sorted_indices_to_remove]
@@ -497,6 +575,7 @@ class AmadeusComposerTSD:
         return seq.tolist()
 
     def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0):
+        # Base setup logic identical to Octuple: create working copies and clear extension tracks
         template = Score(str(input_midi_path))
         combined = copy.deepcopy(template)
         extension_only = copy.deepcopy(template)
@@ -514,10 +593,12 @@ class AmadeusComposerTSD:
             prompt = ids[-256:] 
             if not prompt: continue
             
+            # Sequence Generation
             full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k, top_p)
             cont_ids = full_ids[len(prompt):]
             if not cont_ids: continue
             
+            # The TSD tokenizer requires boolean flags to correctly decode 1D tokens
             new_tok_seq = TokSequence(ids=cont_ids, are_ids_encoded=True)
             if hasattr(self.tokenizer, "decode_token_ids"): self.tokenizer.decode_token_ids(new_tok_seq)
             self.tokenizer.complete_sequence(new_tok_seq)
@@ -546,6 +627,7 @@ class AmadeusComposerTSD:
         for tr in extension_only.tracks:
             for n in tr.notes: n.time -= min_time
 
+        # Export and Render
         base_path_str = str(output_midi_path).replace(".mid", "")
         full_path = f"{base_path_str}_full.mid"
         ext_path = f"{base_path_str}_extension.mid"
