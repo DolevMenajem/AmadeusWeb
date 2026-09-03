@@ -18,31 +18,96 @@ from ..lib.gemini import generate_lecturer_feedback
 
 
 # --- TRI BRAIN IMPORT ---
-from ..models.composer_engine import AmadeusComposerREMI, AmadeusComposerOctuple, AmadeusComposerTSD
-
+# Model weights, tokenizer JSONs, and jam_inference.py are git-ignored and not
+# shipped in the repo. Load them if present; otherwise boot with the AI
+# composers disabled so the rest of the API (upload/evaluate/stats) still works.
 CURRENT_DIR = Path(__file__).resolve().parent
 MODELS_DIR = CURRENT_DIR.parent / "models"
 
-print("Loading Amadeus Tri-Brains into RAM...")
+composer_remi = None
+composer_remi_classical = None
+composer_remi_movies = None
+composer_octuple = None
+composer_tsd = None
 
-# Brain A: REMI
-composer_remi = AmadeusComposerREMI(
-    checkpoint_path=str(MODELS_DIR / "BIG_REMI.pt"), 
-    tokenizer_path=str(MODELS_DIR / "Compose_REMI.json")
-)
+# Each brain loads independently: a missing checkpoint for one model must not
+# disable the others (previously one try/except covered all three, so a missing
+# REMI file silently took the Octuple brain down with it).
+try:
+    from ..models.composer_engine import AmadeusComposerREMI, AmadeusComposerOctuple, AmadeusComposerTSD
+except Exception as e:
+    print(f"[WARN] composer_engine unavailable — all AI brains disabled: {e}")
+else:
+    print("Loading Amadeus Tri-Brains into RAM...")
 
-# Brain B: Octuple
-composer_octuple = AmadeusComposerOctuple(
-    checkpoint_path=str(MODELS_DIR / "checkpoint_best_octuple.pt"), 
-    tokenizer_path=str(MODELS_DIR / "Compose_Octuple.json")
-)
+    # Brain A: REMI base continuation model
+    try:
+        composer_remi = AmadeusComposerREMI(
+            checkpoint_path=str(MODELS_DIR / "BIG_REMI.pt"),
+            tokenizer_path=str(MODELS_DIR / "Compose_REMI.json")
+        )
+    except Exception as e:
+        print(f"[WARN] REMI brain unavailable: {e}")
 
-# Brain C: The New TSD GPT
-composer_tsd = AmadeusComposerTSD(
-    checkpoint_path=str(MODELS_DIR / "checkpoint_best_tsd.pt"), # Ensure your friend's .pt file is named this
-    tokenizer_path=str(MODELS_DIR / "Compose_TSD.json")
-)
-print("Tri-Brains Ready.")
+    # Brain A variants: <RESP> jam fine-tunes, loaded only when installed.
+    # Same class — it auto-detects the extra separator row in the checkpoint.
+    for _name, _ckpt in (("classical", "checkpoint_best_classical.pt"),
+                         ("movies", "checkpoint_best_movies.pt")):
+        _path = MODELS_DIR / _ckpt
+        if not _path.exists():
+            print(f"[INFO] REMI {_name} fine-tune not installed ({_ckpt})")
+            continue
+        try:
+            _engine = AmadeusComposerREMI(
+                checkpoint_path=str(_path),
+                tokenizer_path=str(MODELS_DIR / "Compose_REMI.json")
+            )
+            if _name == "classical":
+                composer_remi_classical = _engine
+            else:
+                composer_remi_movies = _engine
+        except Exception as e:
+            print(f"[WARN] REMI {_name} fine-tune unavailable: {e}")
+
+    # Brain B: Octuple (deployed checkpoint is Compose_Octuple.pt; older
+    # installs may still carry the previous filename)
+    try:
+        _octuple_ckpt = MODELS_DIR / "Compose_Octuple.pt"
+        if not _octuple_ckpt.exists():
+            _octuple_ckpt = MODELS_DIR / "checkpoint_best_octuple.pt"
+        composer_octuple = AmadeusComposerOctuple(
+            checkpoint_path=str(_octuple_ckpt),
+            tokenizer_path=str(MODELS_DIR / "Compose_Octuple.json")
+        )
+    except Exception as e:
+        print(f"[WARN] Octuple brain unavailable: {e}")
+
+    # Brain C: The New TSD GPT
+    try:
+        composer_tsd = AmadeusComposerTSD(
+            checkpoint_path=str(MODELS_DIR / "checkpoint_best_tsd.pt"), # Ensure your friend's .pt file is named this
+            tokenizer_path=str(MODELS_DIR / "Compose_TSD.json")
+        )
+    except Exception as e:
+        print(f"[WARN] TSD brain unavailable: {e}")
+
+    loaded = [n for n, c in (("REMI", composer_remi),
+                             ("REMI-classical", composer_remi_classical),
+                             ("REMI-movies", composer_remi_movies),
+                             ("Octuple", composer_octuple),
+                             ("TSD", composer_tsd)) if c is not None]
+    print(f"AI brains ready: {', '.join(loaded) if loaded else 'none'}")
+
+
+def _get_composer(model_type):
+    """Resolve a modelType string to a loaded engine (None if unavailable)."""
+    return {
+        "remi": composer_remi,
+        "remi_classical": composer_remi_classical,
+        "remi_movies": composer_remi_movies,
+        "octuple": composer_octuple,
+        "tsd": composer_tsd,
+    }.get(model_type, composer_remi)
 # ---------------------------------
 
 router = APIRouter()
@@ -172,13 +237,14 @@ async def simulate_processing(job_id: int, job_type: str, target_genre: str | No
                 tokens_to_generate = (bars or 4) * 32
                 
                 # --- DYNAMIC ROUTING ---
-                if model_type == "octuple":
-                    active_composer = composer_octuple
-                elif model_type == "tsd":
-                    active_composer = composer_tsd
-                else:
-                    active_composer = composer_remi
-                
+                active_composer = _get_composer(model_type)
+
+                if active_composer is None:
+                    raise RuntimeError(
+                        "AI model files (checkpoints/tokenizers) are not present in this "
+                        "installation — the extend feature requires them."
+                    )
+
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None,
@@ -316,20 +382,31 @@ class JamRequest(BaseModel):
     num_generate: int = 64  # Keep it short for fast response (1-2 bars)
     temperature: float = 0.8
     bpm: int = 120
+    model: str = "octuple"  # octuple | remi | remi_classical | remi_movies
 
 @router.post("/jam", status_code=200)
 async def live_jam_endpoint(body: JamRequest):
     """Bypasses SQLite and Disk completely. In-memory RAM to RAM processing."""
     if not body.notes:
         raise HTTPException(status_code=400, detail="No notes provided")
-        
+
+    jam_composer = _get_composer(body.model) if body.model else composer_octuple
+    if jam_composer is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"AI model '{body.model}' is not installed — live jam with it is unavailable.")
+    if not hasattr(jam_composer, "live_extend"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"AI model '{body.model}' does not support live jamming.")
+
     notes_data = [n.model_dump() for n in body.notes]
     # Run in an executor thread so we don't freeze the FastAPI web server
     loop = asyncio.get_running_loop()
     try:
         result_notes = await loop.run_in_executor(
             None,
-            lambda: composer_octuple.live_extend(notes_data, body.num_generate, body.temperature, body.bpm)
+            lambda: jam_composer.live_extend(notes_data, body.num_generate, body.temperature, body.bpm)
         )
         return {"notes": result_notes}
     except Exception as e:
