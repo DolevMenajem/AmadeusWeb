@@ -71,5 +71,14 @@ def get_conn():
             return self
         def __exit__(self, exc_type, exc_val, exc_tb):
             _conn.commit()
-            
-    yield ContextConn()
+
+    # The commit MUST live here, in the generator cleanup: `with get_conn()`
+    # exits through this code path, not through ContextConn.__exit__. Relying
+    # on the latter left every write in one never-committed transaction that
+    # rolled back whenever the server restarted.
+    try:
+        yield ContextConn()
+        _conn.commit()
+    except Exception:
+        _conn.rollback()
+        raise

@@ -9,8 +9,6 @@ import {
   getGetStatsQueryKey,
   useGetJob,
   getGetJobQueryKey,
-  useDownloadJobResult,
-  getDownloadJobResultQueryKey,
   useListGenres,
   getListGenresQueryKey,
 } from "@workspace/api-client-react";
@@ -73,12 +71,8 @@ export default function Transform() {
     },
   });
 
-  const { data: downloadInfo } = useDownloadJobResult(currentJobId as number, {
-    query: {
-      enabled: !!currentJobId && job?.status === "completed",
-      queryKey: getDownloadJobResultQueryKey(currentJobId as number),
-    },
-  });
+  // Download links point straight at the streaming endpoint — it returns the
+  // file itself, not JSON with a url field.
 
   const onSubmit = (values: z.infer<typeof formSchema>) => {
     if (!selectedFile) { setFileError("Please select a MIDI file"); return; }
@@ -209,11 +203,11 @@ export default function Transform() {
                     </div>
                   )}
 
-                  {job.status === "completed" && downloadInfo && (
+                  {job.status === "completed" && (
                     <div className="space-y-3">
-                      <MidiPlayer url={downloadInfo.url} label={`${selectedGenreName ?? job.targetGenre ?? "Transformed"} version`} />
+                      <MidiPlayer url={`/api/jobs/${job.id}/download?type=full`} label={`${selectedGenreName ?? job.targetGenre ?? "Transformed"} version`} />
                       <Button asChild variant="outline" className="w-full gap-2" data-testid="button-download">
-                        <a href={downloadInfo.url} download={downloadInfo.filename}>
+                        <a href={`/api/jobs/${job.id}/download?type=full`} download>
                           <Download className="w-4 h-4" /> Download MIDI
                         </a>
                       </Button>

@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import * as Tone from "tone";
+import Soundfont from "soundfont-player";
 import { Midi } from "@tonejs/midi";
-import { Play, Pause, Square } from "lucide-react";
+import { Play, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -17,18 +17,14 @@ export function MidiPlayer({ url, label, compact = false }: MidiPlayerProps) {
   const [state, setState] = useState<PlayerState>("idle");
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(0);
-  const partsRef = useRef<Tone.Part[]>([]);
-  const synthRef = useRef<Tone.PolySynth | null>(null);
+  const acRef = useRef<AudioContext | null>(null);
+  const instrumentRef = useRef<Soundfont.Player | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startedAtRef = useRef<number>(0);
 
   const clearAll = useCallback(() => {
     if (intervalRef.current) clearInterval(intervalRef.current);
-    partsRef.current.forEach((p) => { p.stop(); p.dispose(); });
-    partsRef.current = [];
-    if (synthRef.current) { synthRef.current.releaseAll(); synthRef.current.dispose(); synthRef.current = null; }
-    Tone.getTransport().stop();
-    Tone.getTransport().cancel();
+    if (instrumentRef.current) instrumentRef.current.stop();
   }, []);
 
   useEffect(() => () => clearAll(), [clearAll]);
@@ -37,7 +33,15 @@ export function MidiPlayer({ url, label, compact = false }: MidiPlayerProps) {
     if (state === "playing") return;
     setState("loading");
     try {
-      await Tone.start();
+      // Same acoustic piano soundfont the live jam page uses — playback should
+      // sound like a piano, not an oscillator synth.
+      const AC = window.AudioContext || (window as any).webkitAudioContext;
+      if (!acRef.current) acRef.current = new AC();
+      await acRef.current.resume();
+      if (!instrumentRef.current) {
+        instrumentRef.current = await Soundfont.instrument(acRef.current, "acoustic_grand_piano");
+      }
+
       const res = await fetch(url);
       if (!res.ok) throw new Error("Failed to fetch MIDI");
       const buf = await res.arrayBuffer();
@@ -45,34 +49,27 @@ export function MidiPlayer({ url, label, compact = false }: MidiPlayerProps) {
 
       clearAll();
 
-      const synth = new Tone.PolySynth(Tone.Synth, {
-        oscillator: { type: "triangle" },
-        envelope: { attack: 0.02, decay: 0.1, sustain: 0.5, release: 0.8 },
-        volume: -8,
-      }).toDestination();
-      synthRef.current = synth;
+      // Skip percussion tracks: a piano playing a drum pattern is noise.
+      const notes = midi.tracks
+        .filter((t) => !t.instrument.percussion && t.notes.length > 0)
+        .flatMap((t) => t.notes);
+      if (notes.length === 0) throw new Error("No playable notes");
 
-      const totalDur = Math.max(...midi.tracks.map((t) => (t.notes.at(-1)?.time ?? 0) + (t.notes.at(-1)?.duration ?? 0)), 1);
+      const totalDur = Math.max(...notes.map((n) => n.time + n.duration), 1);
       setDuration(totalDur);
 
-      const parts: Tone.Part[] = midi.tracks
-        .filter((t) => t.notes.length > 0)
-        .map((track) => {
-          const part = new Tone.Part((time, note: { name: string; duration: number; velocity: number }) => {
-            synth.triggerAttackRelease(note.name, note.duration, time, note.velocity);
-          }, track.notes.map((n) => ({ time: n.time, name: n.name, duration: n.duration, velocity: n.velocity })));
-          part.start(0);
-          return part;
+      const t0 = acRef.current.currentTime + 0.1;
+      notes.forEach((n) => {
+        // Duration floor + release keep short notes sounding like piano taps
+        // instead of hard-cut synth blips (same treatment as the jam page).
+        instrumentRef.current!.play(n.name, t0 + n.time, {
+          duration: Math.max(n.duration, 1.5),
+          release: 0.4,
+          gain: Math.max(n.velocity, 0.2),
         });
-      partsRef.current = parts;
-
-      Tone.getTransport().stop();
-      Tone.getTransport().cancel();
-      Tone.getTransport().position = 0;
+      });
 
       startedAtRef.current = Date.now();
-      Tone.getTransport().start();
-
       setState("playing");
 
       intervalRef.current = setInterval(() => {
@@ -82,7 +79,6 @@ export function MidiPlayer({ url, label, compact = false }: MidiPlayerProps) {
         if (p >= 1) {
           if (intervalRef.current) clearInterval(intervalRef.current);
           setState("done");
-          clearAll();
           setProgress(0);
         }
       }, 100);

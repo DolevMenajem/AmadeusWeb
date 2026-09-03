@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { useListJobs, useDownloadJobResult } from "@workspace/api-client-react";
+import { useListJobs } from "@workspace/api-client-react";
 import { Link, useLocation } from "wouter";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
@@ -21,11 +21,6 @@ import { Download, PlayCircle, Activity, FolderOpen, Database, Layers } from "lu
  * DownloadCell: Handles fetching the secure URL and downloading the finished MIDI/WAV files.
  */
 function DownloadCell({ jobId, status, isLocal }: { jobId: number | string, status: string, isLocal?: boolean }) {
-  const [downloading, setDownloading] = useState(false);
-  
-  const { data: downloadInfo, refetch } = useDownloadJobResult(jobId as number, {
-    query: { enabled: false }
-  });
 
   if (isLocal) {
     if (jobId === "live-active") {
@@ -40,22 +35,16 @@ function DownloadCell({ jobId, status, isLocal }: { jobId: number | string, stat
     return <span className="text-muted-foreground text-xs italic bg-background/50 px-2 py-1 rounded">Archived Locally</span>;
   }
 
-  const handleDownload = async () => {
+  const handleDownload = () => {
     if (status !== "completed") return;
-    setDownloading(true);
-    try {
-      const res = await refetch();
-      if (res.data) {
-        const a = document.createElement("a");
-        a.href = res.data.url;
-        a.download = res.data.filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-      }
-    } finally {
-      setDownloading(false);
-    }
+    // The endpoint streams the file directly (not JSON with a url field);
+    // the filename comes from its Content-Disposition header.
+    const a = document.createElement("a");
+    a.href = `/api/jobs/${jobId}/download?type=full`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
   if (status !== "completed") return <span className="text-muted-foreground text-xs opacity-50">-</span>;
@@ -66,10 +55,9 @@ function DownloadCell({ jobId, status, isLocal }: { jobId: number | string, stat
       size="sm" 
       className="h-8 gap-2 hover:bg-primary/10 hover:text-primary transition-colors" 
       onClick={handleDownload}
-      disabled={downloading}
     >
       <Download className="w-3 h-3" />
-      {downloading ? "..." : "File"}
+      File
     </Button>
   );
 }
