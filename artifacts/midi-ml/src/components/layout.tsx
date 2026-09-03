@@ -1,6 +1,6 @@
 import { Link, useLocation } from "wouter";
 import { cn } from "@/lib/utils";
-import { Home, Music, FastForward, Activity, List, Music2 } from "lucide-react";
+import { Home, Music, FastForward, Activity, List, Music2, Presentation } from "lucide-react";
 import { useHealthCheck } from "@workspace/api-client-react";
 
 export function Layout({ children }: { children: React.ReactNode }) {
@@ -13,6 +13,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
     { href: "/transform", label: "Transform", icon: Music },
     { href: "/evaluate", label: "Evaluation", icon: Activity },
     { href: "/live", label: "Live Extend", icon: Music2 },
+    { href: "/showcase", label: "Showcase", icon: Presentation },
     { href: "/jobs", label: "All Jobs", icon: List },
   ];
 

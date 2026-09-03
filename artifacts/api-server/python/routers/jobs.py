@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import shutil
 import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
@@ -328,6 +329,56 @@ async def extend_midi(body: ExtendInput):
     return serialize_job(row)
 
 
+# ── POST /jobs/showcase ───────────────────────────────────────────────────────
+# Files a manually loaded showcase (see the Showcase page) as a completed job.
+# The uploaded files are copied into the amadeus_creation_{id} naming convention,
+# so every existing consumer (downloads, ?type=audio, the Jobs page) works on
+# committed showcases without any special-casing.
+
+class ShowcaseInput(BaseModel):
+    fullFilename: str
+    inputFilename: str | None = None      # the seed, when the user provided one
+    extensionFilename: str | None = None  # the AI part alone, when provided
+    barsToExtend: int | None = None
+
+@router.post("/jobs/showcase", status_code=201)
+async def commit_showcase(body: ShowcaseInput):
+    uploads = Path(UPLOADS_DIR)
+    full_src = uploads / Path(body.fullFilename).name
+    if not full_src.exists():
+        raise HTTPException(status_code=404, detail="Full result file not found in uploads")
+    input_name = Path(body.inputFilename).name if body.inputFilename else None
+    ext_name = Path(body.extensionFilename).name if body.extensionFilename else None
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO jobs (type, status, input_filename, bars_to_extend, completed_at) VALUES (%s, %s, %s, %s, %s) RETURNING *",
+                ("showcase", "completed", input_name, body.barsToExtend,
+                 datetime.now(timezone.utc)),
+            )
+            row = cur.fetchone()
+
+    base = f"amadeus_creation_{row['id']}"
+    shutil.copyfile(full_src, uploads / f"{base}.mid")
+    shutil.copyfile(full_src, uploads / f"{base}_full.mid")
+    if ext_name and (uploads / ext_name).exists():
+        shutil.copyfile(uploads / ext_name, uploads / f"{base}_extension.mid")
+    # The showcase render endpoint writes the WAV as <full stem>.wav — adopt it
+    wav_src = uploads / f"{full_src.stem}.wav"
+    if wav_src.exists():
+        shutil.copyfile(wav_src, uploads / f"{base}.wav")
+
+    output_name = f"{base}.mid"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE jobs SET output_filename = %s WHERE id = %s",
+                        (output_name, row["id"]))
+    row = dict(row)
+    row["output_filename"] = output_name
+    return serialize_job(row)
+
+
 # ── POST /jobs/transform ──────────────────────────────────────────────────────
 
 class TransformInput(BaseModel):
@@ -478,13 +529,18 @@ def download_job_result(job_id: int, type: str = "full"):
         download_name = f"full_{row['output_filename']}"
 
     file_path = Path(UPLOADS_DIR) / file_name
-    
-    # Fallback just in case an older job only has the base .mid file
+
     if not file_path.exists():
+        # No WAV means no server-side audio render (FluidSynth/soundfont not
+        # installed) — report that honestly instead of serving a MIDI file the
+        # browser's <audio> element cannot decode.
+        if type == "audio":
+            raise HTTPException(status_code=404, detail="Audio render not available")
+        # Fallback just in case an older job only has the base .mid file
         file_path = Path(UPLOADS_DIR) / row["output_filename"]
         download_name = row["output_filename"]
         media_type = "audio/midi"
-        
+
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found on disk")
         

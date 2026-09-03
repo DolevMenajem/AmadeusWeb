@@ -148,6 +148,7 @@ export default function LiveExtend() {
   const [activeKeys, setActiveKeys] = useState<number[]>([]);
   const [temperature, setTemperature] = useState([0.85]);
   const [numGenerate, setNumGenerate] = useState([64]);
+  const [autoTokens, setAutoTokens] = useState(true); // match answer length to the notes played
   const [jamModel, setJamModel] = useState("octuple");
   const [topK, setTopK] = useState([0]);
   const [topP, setTopP] = useState([0.95]);
@@ -410,16 +411,22 @@ export default function LiveExtend() {
     setMessages((prev) => [...prev, userMsg]);
     setCurrentRecording([]);
 
+    // Auto mode answers with roughly as many tokens as notes were played
+    // (clamped to the slider's own range); otherwise the slider value is used.
+    const tokensToRequest = autoTokens
+      ? Math.min(128, Math.max(16, userMsg.notes.length))
+      : numGenerate[0];
+
     setIsWaitingForAI(true);
     try {
-      logSystem(`[NET] Initiating POST /api/jam (tokens: ${numGenerate[0]}, temp: ${temperature[0]})...`);
-      
+      logSystem(`[NET] Initiating POST /api/jam (tokens: ${tokensToRequest}${autoTokens ? " [auto]" : ""}, temp: ${temperature[0]})...`);
+
       const response = await fetch("/api/jam", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           notes: userMsg.notes,
-          num_generate: numGenerate[0],
+          num_generate: tokensToRequest,
           temperature: temperature[0],
           top_k: topK[0],
           top_p: topP[0],
@@ -706,10 +713,25 @@ export default function LiveExtend() {
                   
                   <div className="space-y-3 group">
                     <div className="flex items-center justify-between text-sm">
-                      <label className="font-medium group-hover:text-primary transition-colors">Tokens</label>
-                      <span className="font-mono text-muted-foreground bg-primary/10 px-2 py-0.5 rounded">{numGenerate[0]}</span>
+                      <div className="flex items-center gap-2">
+                        <label className="font-medium group-hover:text-primary transition-colors">Tokens</label>
+                        <label className="flex items-center gap-1 text-xs text-muted-foreground cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={autoTokens}
+                            onChange={(e) => setAutoTokens(e.target.checked)}
+                            className="accent-primary w-3.5 h-3.5 cursor-pointer"
+                          />
+                          Auto
+                        </label>
+                      </div>
+                      <span className="font-mono text-muted-foreground bg-primary/10 px-2 py-0.5 rounded">
+                        {autoTokens ? "auto" : numGenerate[0]}
+                      </span>
                     </div>
-                    <Slider value={numGenerate} onValueChange={setNumGenerate} min={16} max={128} step={16} />
+                    <div className={autoTokens ? "opacity-40 pointer-events-none" : ""}>
+                      <Slider value={numGenerate} onValueChange={setNumGenerate} min={16} max={128} step={16} disabled={autoTokens} />
+                    </div>
                   </div>
                   
                   <div className="space-y-3 group">

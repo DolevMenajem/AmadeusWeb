@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -9,8 +9,6 @@ import {
   getGetStatsQueryKey,
   useGetJob,
   getGetJobQueryKey,
-  useDownloadJobResult,
-  getDownloadJobResultQueryKey,
 } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -22,6 +20,7 @@ import { Slider } from "@/components/ui/slider";
 import { JobStatusBadge } from "@/components/job-status-badge";
 import { MidiFileUpload } from "@/components/midi-file-upload";
 import { MidiVisualizer } from  "@/components/midi-visualizer";
+import { MidiPlayer } from "@/components/midi-player";
 import { InlineEdit } from "@/components/inline-edit";
 
 // Hooks & Icons
@@ -80,12 +79,10 @@ export default function Extend() {
     },
   });
 
-  const { data: downloadInfo } = useDownloadJobResult(currentJobId as number, {
-    query: {
-      enabled: !!currentJobId && job?.status === "completed",
-      queryKey: getDownloadJobResultQueryKey(currentJobId as number),
-    },
-  });
+  // When the server has no WAV render (e.g. FluidSynth/soundfont not installed),
+  // the audio element errors and we fall back to a client-side piano player.
+  const [wavFailed, setWavFailed] = useState(false);
+  useEffect(() => { setWavFailed(false); }, [currentJobId]);
 
   // --- FORM INITIALIZATION ---
   const form = useForm<z.infer<typeof formSchema>>({
@@ -349,15 +346,22 @@ export default function Extend() {
                           />
                         </div>
 
-                        <audio 
-                          ref={setAudioEl}
-                          controls 
-                          className="w-full h-10 rounded-md shadow-sm" 
-                          src={`/api/jobs/${job.id}/download?type=audio`}
-                          controlsList="nodownload"
-                        >
-                          Your browser does not support the audio element.
-                        </audio>
+                        {!wavFailed ? (
+                          <audio
+                            ref={setAudioEl}
+                            controls
+                            className="w-full h-10 rounded-md shadow-sm"
+                            src={`/api/jobs/${job.id}/download?type=audio`}
+                            controlsList="nodownload"
+                            onError={() => setWavFailed(true)}
+                          >
+                            Your browser does not support the audio element.
+                          </audio>
+                        ) : (
+                          // No server-side WAV render available — play the MIDI
+                          // in the browser with the piano sampler instead.
+                          <MidiPlayer compact url={`/api/jobs/${job.id}/download?type=full`} label="Piano preview (in-browser render)" />
+                        )}
                       </div>
 
                       {/* Download Actions */}

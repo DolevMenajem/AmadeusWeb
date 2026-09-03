@@ -14,6 +14,16 @@ import traceback
 
 # ─── SHARED UTILITIES ────────────────────────────────────────────────────────
 
+# Soundfont for the optional server-side WAV render. The default only exists on
+# Linux; set SOUNDFONT_PATH (e.g. in .env) to a local .sf2 to enable rendering
+# elsewhere. When the file is missing, rendering is skipped and the frontend
+# falls back to its in-browser piano player.
+SOUNDFONT_PATH = os.environ.get("SOUNDFONT_PATH", "/usr/share/sounds/sf2/FluidR3_GM.sf2")
+
+# FluidSynth binary. On Linux it is usually on PATH; on Windows point
+# FLUIDSYNTH_PATH at the .exe (e.g. the copy under api-server/tools/).
+FLUIDSYNTH_BIN = os.environ.get("FLUIDSYNTH_PATH", "fluidsynth")
+
 def _rescale_score_inplace(score, dst_tpq):
     # Adjusts the Ticks Per Quarter (TPQ) resolution of a MIDI score.
     # ML models often require a specific grid resolution (e.g., 480 TPQ).
@@ -368,10 +378,10 @@ class AmadeusComposerREMI:
         extension_only.dump_midi(ext_path)
         combined.dump_midi(str(output_midi_path))
 
-        soundfont = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
+        soundfont = SOUNDFONT_PATH
         if os.path.exists(soundfont):
             try:
-                subprocess.run(["fluidsynth", "-ni", soundfont, full_path, "-F", wav_path, "-r", "44100"], check=True, stdout=subprocess.DEVNULL)
+                subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
             except Exception as e:
                 print(f"FluidSynth error: {e}")
 
@@ -893,10 +903,10 @@ class AmadeusComposerOctuple:
         extension_only.dump_midi(ext_path)
         combined.dump_midi(str(output_midi_path))
 
-        soundfont = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
+        soundfont = SOUNDFONT_PATH
         if os.path.exists(soundfont):
             try:
-                subprocess.run(["fluidsynth", "-ni", soundfont, full_path, "-F", wav_path, "-r", "44100"], check=True, stdout=subprocess.DEVNULL)
+                subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
             except Exception as e:
                 print(f"FluidSynth error: {e}")
 
@@ -1146,10 +1156,10 @@ class AmadeusComposerTSD:
         combined.dump_midi(full_path)
         extension_only.dump_midi(ext_path)
         
-        soundfont = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
+        soundfont = SOUNDFONT_PATH
         if os.path.exists(soundfont):
             try:
-                subprocess.run(["fluidsynth", "-ni", soundfont, full_path, "-F", wav_path, "-r", "44100"], check=True, stdout=subprocess.DEVNULL)
+                subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
             except Exception as e:
                 print(f"FluidSynth error: {e}")
 
