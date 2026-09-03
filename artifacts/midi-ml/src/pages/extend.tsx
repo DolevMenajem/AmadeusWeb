@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -9,8 +9,6 @@ import {
   getGetStatsQueryKey,
   useGetJob,
   getGetJobQueryKey,
-  useDownloadJobResult,
-  getDownloadJobResultQueryKey,
 } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -22,6 +20,7 @@ import { Slider } from "@/components/ui/slider";
 import { JobStatusBadge } from "@/components/job-status-badge";
 import { MidiFileUpload } from "@/components/midi-file-upload";
 import { MidiVisualizer } from  "@/components/midi-visualizer";
+import { MidiPlayer } from "@/components/midi-player";
 import { InlineEdit } from "@/components/inline-edit";
 
 // Hooks & Icons
@@ -36,7 +35,7 @@ const formSchema = z.object({
   temperature: z.number().min(0.1).max(2.0),
   topK: z.number().min(0).max(100),
   topP: z.number().min(0.1).max(1.0),
-  modelType: z.enum(["remi", "octuple", "tsd"]),
+  modelType: z.enum(["remi", "remi_classical", "remi_movies", "octuple", "tsd"]),
 });
 
 export default function Extend() {
@@ -80,12 +79,10 @@ export default function Extend() {
     },
   });
 
-  const { data: downloadInfo } = useDownloadJobResult(currentJobId as number, {
-    query: {
-      enabled: !!currentJobId && job?.status === "completed",
-      queryKey: getDownloadJobResultQueryKey(currentJobId as number),
-    },
-  });
+  // When the server has no WAV render (e.g. FluidSynth/soundfont not installed),
+  // the audio element errors and we fall back to a client-side piano player.
+  const [wavFailed, setWavFailed] = useState(false);
+  useEffect(() => { setWavFailed(false); }, [currentJobId]);
 
   // --- FORM INITIALIZATION ---
   const form = useForm<z.infer<typeof formSchema>>({
@@ -159,12 +156,16 @@ export default function Extend() {
                         className="flex h-10 w-full rounded-md border border-input bg-background/50 backdrop-blur-sm px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         <option value="remi">Standard Model (Single-Track / REMI)</option>
+                        <option value="remi_classical">Classical Model (REMI Fine-Tune)</option>
+                        <option value="remi_movies">Movie Score Model (REMI Fine-Tune)</option>
                         <option value="octuple">Multi-Track Model (Full Band / Octuple)</option>
                         <option value="tsd">Next-Gen GPT Model (Experimental / TSD)</option>
                       </select>
                     </FormControl>
                     <p className="text-xs text-muted-foreground mt-2 leading-relaxed">
                       {field.value === "remi" && "Generates a continuation for only the primary instrument."}
+                      {field.value === "remi_classical" && "Single-track continuation with a classical-music flavor (fine-tuned REMI)."}
+                      {field.value === "remi_movies" && "Single-track continuation with a cinematic film-score flavor (fine-tuned REMI)."}
                       {field.value === "octuple" && "Generates a coordinated continuation for drums, bass, chords, and melody."}
                       {field.value === "tsd" && "Uses an advanced GPT-style transformer for high-fidelity timing generation."}
                     </p>
@@ -345,15 +346,22 @@ export default function Extend() {
                           />
                         </div>
 
-                        <audio 
-                          ref={setAudioEl}
-                          controls 
-                          className="w-full h-10 rounded-md shadow-sm" 
-                          src={`/api/jobs/${job.id}/download?type=audio`}
-                          controlsList="nodownload"
-                        >
-                          Your browser does not support the audio element.
-                        </audio>
+                        {!wavFailed ? (
+                          <audio
+                            ref={setAudioEl}
+                            controls
+                            className="w-full h-10 rounded-md shadow-sm"
+                            src={`/api/jobs/${job.id}/download?type=audio`}
+                            controlsList="nodownload"
+                            onError={() => setWavFailed(true)}
+                          >
+                            Your browser does not support the audio element.
+                          </audio>
+                        ) : (
+                          // No server-side WAV render available — play the MIDI
+                          // in the browser with the piano sampler instead.
+                          <MidiPlayer compact url={`/api/jobs/${job.id}/download?type=full`} label="Piano preview (in-browser render)" />
+                        )}
                       </div>
 
                       {/* Download Actions */}

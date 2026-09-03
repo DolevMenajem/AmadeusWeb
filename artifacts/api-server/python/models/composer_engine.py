@@ -1,6 +1,7 @@
 import os
 import copy
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,9 +12,17 @@ import tempfile
 import subprocess
 import traceback
 
-from .jam_inference import JamModel
+# ─── SHARED UTILITIES ────────────────────────────────────────────────────────
 
-# ─── SHARED UTILITIES FOR MULTI-TRACK ────────────────────────────────────────
+# Soundfont for the optional server-side WAV render. The default only exists on
+# Linux; set SOUNDFONT_PATH (e.g. in .env) to a local .sf2 to enable rendering
+# elsewhere. When the file is missing, rendering is skipped and the frontend
+# falls back to its in-browser piano player.
+SOUNDFONT_PATH = os.environ.get("SOUNDFONT_PATH", "/usr/share/sounds/sf2/FluidR3_GM.sf2")
+
+# FluidSynth binary. On Linux it is usually on PATH; on Windows point
+# FLUIDSYNTH_PATH at the .exe (e.g. the copy under api-server/tools/).
+FLUIDSYNTH_BIN = os.environ.get("FLUIDSYNTH_PATH", "fluidsynth")
 
 def _rescale_score_inplace(score, dst_tpq):
     # Adjusts the Ticks Per Quarter (TPQ) resolution of a MIDI score.
@@ -28,303 +37,332 @@ def _rescale_score_inplace(score, dst_tpq):
     score.tpq = dst_tpq
     return score
 
-class Attention(nn.Module):
-    # Standard Multi-Head Self-Attention wrapper used by the Octuple hybrid model.
-    def __init__(self, hidden_dim, num_heads=8, dropout=0.0):
-        super().__init__()
-        self.mha = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, x):
-        seq_len = x.size(1)
-        # Create a causal mask (upper triangular) to prevent the model from looking into the future
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
-        attn_out, _ = self.mha(query=x, key=x, value=x, attn_mask=causal_mask, need_weights=False)
-        # Add residual connection and apply layer normalization
-        return self.norm(x + attn_out)
+def _beats_per_bar(score):
+    # Bar length in quarter notes, taken from the first time signature (4/4 default).
+    if score.time_signatures:
+        ts = score.time_signatures[0]
+        return ts.numerator * 4.0 / ts.denominator
+    return 4.0
 
-# ─── 1. UPGRADED REMI MODEL (BIFG GPT via JamModel) ─────────────────────────
+
+def _score_from_live_notes(notes_data, bpm):
+    # Builds a symusic Score from browser note dicts (the live-jam payload).
+    raw_score = Score(480)
+    raw_score.tempos.append(Tempo(time=0, qpm=bpm))
+    raw_score.time_signatures.append(TimeSignature(time=0, numerator=4, denominator=4))
+
+    track = Track(program=0, is_drum=False, name="LiveJam")
+    for nd in notes_data:
+        track.notes.append(Note(
+            time=int(nd['time']),
+            duration=int(nd['duration']),
+            pitch=int(nd['pitch']),
+            velocity=int(nd['velocity'])
+        ))
+    track.notes.sort(key=lambda n: getattr(n, 'time', 0))
+    raw_score.tracks.append(track)
+
+    # Symusic requires file I/O for a clean re-instantiation
+    fd, path = tempfile.mkstemp(suffix=".mid")
+    os.close(fd)
+    raw_score.dump_midi(path)
+    score = Score(path)
+    os.remove(path)
+    return score
+
+
+def _live_notes_response(cont_score):
+    # Formats a decoded continuation as the JSON note array the frontend expects,
+    # normalized so the first note starts at time 0.
+    raw_notes = [n for tr in cont_score.tracks for n in tr.notes]
+    raw_notes.sort(key=lambda n: getattr(n, 'time', 0))
+    if not raw_notes:
+        return []
+    min_time = min(getattr(n, 'time', 0) for n in raw_notes)
+    return [{
+        "pitch": getattr(n, 'pitch', 60),
+        "time": getattr(n, 'time', 0) - min_time,
+        "duration": getattr(n, 'duration', 120),
+        "velocity": getattr(n, 'velocity', 80)
+    } for n in raw_notes]
+
+# ─── 1. REMI MODEL (ComposerGPT, base + <RESP> jam fine-tunes) ───────────────
+# Self-contained port of GPT_Remi_Generation_ipynb.ipynb (cells 5-9); replaces
+# the old JamModel wrapper from jam_inference.py. Handles BOTH checkpoint
+# generations:
+#   - base continuation model: vocab == len(tokenizer)      (e.g. BIG_REMI.pt)
+#   - jam fine-tunes:          vocab == len(tokenizer) + 1  (classical/movies),
+#     trained with a <RESP> separator between riff and response, every response
+#     ending with EOS.
 
 class AmadeusComposerREMI:
-    # Wrapper for the primary Single-Track model, leaning on an external JamModel architecture
-    def __init__(self, checkpoint_path, tokenizer_path):
-        # Dynamically assigns processing to GPU if available to speed up matrix multiplication
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Loading Upgraded REMI JamModel from {checkpoint_path} on {self.device}...")
-        self.jam = JamModel(
-            checkpoint_path=str(checkpoint_path),
-            tokenizer_path=str(tokenizer_path),
-            device=self.device
-        )
+    PROMPT_BARS = 8   # prompt trimmed to its last N bars, cut on a bar line
+    CHUNK_BARS = 4    # bars requested per generation round in extend_midi
 
-    def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0):
+    def __init__(self, checkpoint_path, tokenizer_path):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.tokenizer = REMI(params=Path(tokenizer_path))
+        tok_len = len(self.tokenizer)
+
         try:
-            # Convert token count to approximate musical bars (assuming ~32 tokens per bar)
-            bars_to_extend = max(1, num_generate // 32)
-            temp = temperature if temperature is not None else 0.8
-            p = top_p if top_p is not None else 0.9
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        except Exception:
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        sd = ckpt.get("model", ckpt)
+        sd = {k[7:] if k.startswith("module.") else k: v for k, v in sd.items()}
 
-            print(f"[REMI] Continuing song for {bars_to_extend} bars...")
+        # Architecture from the WEIGHT SHAPES, never from cfg (cfg has drifted
+        # between training runs in this project).
+        vocab_size, d_model = (int(x) for x in sd["tok_emb.weight"].shape)
+        max_seq_len = int(sd["pos_emb.weight"].shape[0])
+        n_layers = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("blocks."))
 
-            # Generate full extended score (prompt + extension)
-            # include_prompt=True stitches the original input to the new generation
-            full_score, info = self.jam.continue_song(
-                midi=str(input_midi_path),
-                n_bars=bars_to_extend,
-                temperature=temp,
-                top_p=p,
-                include_prompt=True,
-                progress=False
-            )
-
-            # Generate isolated extension only (without prompt)
-            # include_prompt=False returns ONLY the AI's continuation
-            ext_score, _ = self.jam.continue_song(
-                midi=str(input_midi_path),
-                n_bars=bars_to_extend,
-                temperature=temp,
-                top_p=p,
-                include_prompt=False,
-                progress=False
-            )
-
-            # Prepare file output paths
-            base_path_str = str(output_midi_path).replace(".mid", "")
-            full_path = f"{base_path_str}_full.mid"
-            ext_path = f"{base_path_str}_extension.mid"
-            wav_path = f"{base_path_str}.wav"
-
-            # Save MIDI files to disk
-            full_score.dump_midi(full_path)
-            ext_score.dump_midi(ext_path)
-            full_score.dump_midi(str(output_midi_path))
-
-            # Render Audio with FluidSynth
-            # Uses a standard General MIDI (GM) SoundFont to synthesize audio
-            soundfont = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
-            if os.path.exists(soundfont):
-                try:
-                    # Executes the FluidSynth CLI tool as a subprocess to render a 44.1kHz WAV
-                    subprocess.run(
-                        ["fluidsynth", "-ni", soundfont, full_path, "-F", wav_path, "-r", "44100"],
-                        check=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-                except Exception as e:
-                    print(f"FluidSynth error: {e}")
-
-            print(f"[REMI] Completed successfully. Info: {info}")
-            return output_midi_path
-
-        except Exception as e:
-            print(f"[REMI ERROR] Failed to generate: {e}")
-            traceback.print_exc()
-            raise e
-
-
-# ─── 2. NEW MULTI-TRACK MODEL (OCTUPLE) ───────────────────────────────────────
-
-class ComposerMidiOctuple(nn.Module):
-    # Hybrid LSTM + Attention architecture designed specifically for the Octuple tokenization strategy
-    # Octuple uses multi-dimensional tokens (pitch, velocity, duration, etc. are passed simultaneously)
-    def __init__(self, sub_vocab_sizes, embed_size, hidden_size, num_layers=2, num_heads=8, dropout=0.1):
-        super().__init__()
-        self.sub_vocab_sizes = list(sub_vocab_sizes)
-        self.num_streams = len(self.sub_vocab_sizes) # Number of independent token streams (e.g., 8 for Octuple)
-        
-        # Create an independent embedding layer for each stream in the token tuple
-        self.embeddings = nn.ModuleList([nn.Embedding(v, embed_size) for v in self.sub_vocab_sizes])
-        self.embed_dropout = nn.Dropout(dropout)
-        
-        # Core sequence modeling: RNN (LSTM) handles local time, Attention handles global context
-        self.lstm = nn.LSTM(embed_size, hidden_size, num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
-        self.attention = Attention(hidden_size, num_heads=num_heads, dropout=dropout)
-        
-        # Output heads: Decodes the hidden state back into probabilities for EACH stream independently
-        self.heads = nn.ModuleList([nn.Linear(hidden_size, v) for v in self.sub_vocab_sizes])
-
-    def forward(self, x, hidden=None):
-        # x shape: [Batch, Sequence_Length, Streams]
-        # Sum the embeddings of all streams together to create a unified token representation
-        embedded = self.embeddings[0](x[..., 0])
-        for s in range(1, self.num_streams):
-            embedded = embedded + self.embeddings[s](x[..., s])
-            
-        embedded = self.embed_dropout(embedded)
-        lstm_out, hidden = self.lstm(embedded, hidden)
-        attended = self.attention(lstm_out)
-        
-        # Generate independent predictions for each part of the Octuple tuple
-        logits = [head(attended) for head in self.heads]
-        return logits, hidden
-
-class AmadeusComposerOctuple:
-    def __init__(self, checkpoint_path, tokenizer_path):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")    
-
-        # Setup MidiTok Octuple tokenizer
-        target_path = Path(tokenizer_path).parent / "Compose_Octuple.json"
-        if target_path.exists():
-            self.tokenizer = Octuple(params=target_path)
+        # <RESP> auto-detect: the jam fine-tunes carry one extra embedding row
+        # for the riff/response separator, which has no tokenizer entry.
+        if vocab_size == tok_len + 1:
+            self.resp_id = tok_len
+        elif vocab_size == tok_len:
+            self.resp_id = None
         else:
-            self.tokenizer = Octuple(params=Path(tokenizer_path))
-            
-        # Load weights and extract configuration metadata
-        ckpt = torch.load(checkpoint_path, map_location=self.device)
-        cfg = ckpt["config"]
-        self.seq_len = cfg["seq_len"]
-        
-        self.sub_vocab_sizes = [len(v) for v in self.tokenizer.vocab]
-        self.num_streams = len(self.sub_vocab_sizes)
-        
-        # Identify the specific index for 'Bar' tokens. 
-        # This is critical to prevent the model from generating infinitely into the future.
-        self.bar_stream_idx = self.tokenizer.vocab_types_idx.get("Bar", 2)
-        bar_vocab = self.tokenizer.vocab[self.bar_stream_idx]
-        self.bar_values = torch.full((len(bar_vocab),), -1, dtype=torch.long, device=self.device)
-        
-        # Extract integer values from Bar tokens (e.g., "Bar_5" -> 5)
-        for tok_str, tid in bar_vocab.items():
-            parts = tok_str.split("_", 1)
-            if len(parts) == 2:
-                try: self.bar_values[tid] = int(parts[1])
-                except ValueError: pass
+            raise ValueError(
+                f"Checkpoint vocab {vocab_size} does not match tokenizer "
+                f"({tok_len} or {tok_len + 1} expected) — mismatched pair")
 
-        self.model = ComposerMidiOctuple(
-            sub_vocab_sizes=self.sub_vocab_sizes, embed_size=cfg["embed_size"],
-            hidden_size=cfg["hidden_size"], num_layers=cfg["num_layers"], dropout=cfg.get("dropout", 0.0)
+        cfg = ckpt.get("config") or {}
+        # Positions past the trained window never received gradients: the model
+        # was built at max_seq_len=1024 but trained on 511-token windows.
+        self.max_ctx = min(int(cfg.get("seq_len") or max_seq_len), max_seq_len)
+
+        self.model = ComposerGPT(
+            vocab_size=vocab_size, d_model=d_model, n_layers=n_layers,
+            n_heads=int(cfg.get("n_heads", 8)),
+            max_seq_len=max_seq_len, dropout=0.0,
         ).to(self.device)
-        self.model.load_state_dict(ckpt["model"])
+        self.model.load_state_dict(sd, strict=True)
         self.model.eval()
+        self.vocab_size = vocab_size
 
-    def _sample_one_stream(self, logits_1d, temperature, top_k, top_p):
-        # Applies temperature scaling to flatten or sharpen the probability distribution
-        temperature = temperature or 0.8
-        logits_1d = logits_1d / max(temperature, 1e-8)
-        
-        # Top-K Sampling: Zero out all probabilities outside the top K highest values
-        if top_k and top_k > 0:
-            k = min(top_k, logits_1d.size(-1))
-            v, _ = torch.topk(logits_1d, k)
-            logits_1d = logits_1d.clone()
-            logits_1d[logits_1d < v[-1]] = -float("inf")
-            
-        # Nucleus (Top-P) Sampling: Filter out tokens whose cumulative probability exceeds P
-        if top_p and 0 < top_p < 1.0:
-            sorted_logits, sorted_idx = torch.sort(logits_1d, descending=True)
-            cum = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            remove = cum > top_p
-            remove[1:] = remove[:-1].clone() # Shift mask to keep the token that crosses the threshold
-            remove[0] = False
-            sorted_logits[remove] = -float("inf")
-            logits_1d = torch.full_like(logits_1d, -float("inf"))
-            logits_1d.scatter_(0, sorted_idx, sorted_logits)
-            
-        # Convert filtered logits to probabilities and sample a single token
-        probs = F.softmax(logits_1d, dim=-1)
-        return int(torch.multinomial(probs, num_samples=1))
+        base = self.tokenizer.vocab if isinstance(self.tokenizer.vocab, dict) else \
+               {t: i for i, t in enumerate(self.tokenizer.vocab)}
+        self.is_bpe = tok_len > len(base)
+        self.bars, self.has_pitch = self._build_tables(base)
+
+        # Ban structural specials, and never sample the separator itself.
+        self.banned = []
+        for name in ("PAD_None", "BOS_None", "MASK_None"):
+            try: self.banned.append(self.tokenizer[name])
+            except Exception: pass
+        if self.resp_id is not None:
+            self.banned.append(self.resp_id)
+        try:
+            self.eos_id = self.tokenizer["EOS_None"]
+        except Exception:
+            self.eos_id = None
+
+        mode = "jam fine-tune (<RESP>)" if self.resp_id is not None else "base continuation"
+        print(f"[REMI] loaded {mode}: {n_layers} layers, d_model {d_model}, "
+              f"vocab {vocab_size}, context {self.max_ctx} tokens, bpe={self.is_bpe}")
+
+    def _build_tables(self, base_vocab):
+        """Per-id Bar-token counts and Pitch presence. Under BPE one id can
+        expand to several base tokens, so both need the expansion — built once
+        at load. The <RESP> row (if any) has no token and stays 0/0."""
+        bar_base = {i for t, i in base_vocab.items() if t.startswith("Bar")}
+        pitch_base = {i for t, i in base_vocab.items() if t.startswith("Pitch")}
+        bars = [0] * self.vocab_size
+        pitch = [0] * self.vocab_size
+        for i in range(len(self.tokenizer)):
+            if not self.is_bpe:
+                bars[i] = 1 if i in bar_base else 0
+                pitch[i] = 1 if i in pitch_base else 0
+                continue
+            try:
+                s = TokSequence(ids=[i], are_ids_encoded=True)
+                self.tokenizer.decode_token_ids(s)
+                toks = [t for t in (s.tokens or []) if isinstance(t, str)]
+                bars[i] = sum(1 for t in toks if t.startswith("Bar"))
+                pitch[i] = int(any(t.startswith("Pitch") for t in toks))
+            except Exception:
+                pass
+        return bars, pitch
+
+    # -------------------------------------------------- tokens
+
+    @staticmethod
+    def _densest_track_idx(score):
+        """The dataset was tokenized single-track with DROP_DRUMS=True, so the
+        model continues one pitched instrument — the busiest one."""
+        cands = [(len(t.notes), i) for i, t in enumerate(score.tracks)
+                 if not t.is_drum and len(t.notes) > 0]
+        if not cands:
+            raise ValueError("no usable (non-drum, non-empty) tracks")
+        return max(cands)[1]
+
+    def _encode_track(self, score, idx):
+        single = copy.deepcopy(score)
+        single.tracks = [single.tracks[idx]]
+        res = self.tokenizer.encode(single)
+        seqs = res if isinstance(res, list) else [res]
+        best = max(seqs, key=lambda s: len(getattr(s, "ids", []) or []))
+        return [int(i) for i in (best.ids or [])]
+
+    def _decode(self, ids):
+        ids = [int(i) for i in ids]
+        if self.resp_id is not None:
+            ids = [i for i in ids if i != self.resp_id]  # <RESP> has no token
+        return self.tokenizer.decode([TokSequence(ids=ids, are_ids_encoded=self.is_bpe)])
+
+    # -------------------------------------------------- bar utilities
+
+    def _count_bars(self, ids):
+        return sum(self.bars[t] for t in ids)
+
+    def _last_n_bars(self, ids, n):
+        """Suffix holding the last n complete bars, starting on a bar line.
+        BARS[t] is a COUNT, not a flag — under BPE one id can hold several
+        Bar tokens, so accumulate rather than index bar positions."""
+        ids = list(ids)
+        total = self._count_bars(ids)
+        if total <= n:
+            return ids
+        bars = 0
+        for i, t in enumerate(ids):
+            bars += self.bars[t]
+            if bars > total - n:
+                return ids[i:]
+        return ids
+
+    def _fit_context(self, ids, reserve=0):
+        """Cut to max_ctx (minus `reserve` slots), preferring a bar line."""
+        limit = self.max_ctx - reserve
+        ids = list(ids)
+        if len(ids) <= limit:
+            return ids
+        window = ids[-limit:]
+        for i, t in enumerate(window):
+            if self.bars[t]:
+                return window[i:] if i < len(window) - 32 else window
+        return window
+
+    # -------------------------------------------------- generation
 
     @torch.no_grad()
-    def _generate_tokens(self, prompt_ids, num_tokens, temperature, top_k, top_p, max_bar_window=2):
-        # Auto-regressive generation loop for multidimensional tokens
-        seq = torch.tensor([list(t) for t in prompt_ids], dtype=torch.long, device=self.device)
-        
-        # Determine the starting measure (Bar) so we can control how far ahead we generate
-        prompt_bar_vals = self.bar_values[seq[:, self.bar_stream_idx]]
-        valid = prompt_bar_vals >= 0
-        max_bar = int(prompt_bar_vals[valid].max()) if valid.any() else 0
-        
-        for _ in range(num_tokens):
-            # Feed the last N tokens into the model (context window)
-            context = seq[-self.seq_len:].unsqueeze(0)
-            logits, _ = self.model(context)
-            
-            next_tuple = []
-            # Sample each stream (Pitch, Velocity, Bar, etc.) one by one
-            for s in range(self.num_streams):
-                next_logits = logits[s][0, -1].float().clone()
-                
-                # Hard constraint: Prevent generating a Bar token that exceeds our window
-                if s == self.bar_stream_idx:
-                    threshold = max_bar + max_bar_window
-                    too_far = self.bar_values > threshold
-                    next_logits[too_far] = -float("inf")
-                
-                next_id = self._sample_one_stream(next_logits, temperature, top_k, top_p)
-                next_tuple.append(next_id)
-                
-                # Update the max bar tracker if we just generated a new measure
-                if s == self.bar_stream_idx:
-                    val = int(self.bar_values[next_id])
-                    if val > max_bar: max_bar = val
-                    
-            # Append the completed multi-dimensional token to the sequence
-            seq = torch.cat([seq, torch.tensor([next_tuple], dtype=torch.long, device=self.device)], dim=0)
-        return seq.tolist()
+    def _generate(self, prompt_ids, n_bars=2, temperature=1.0, top_p=0.9,
+                  max_new_tokens=None, min_notes=4):
+        """Continue prompt_ids until n_bars Bar tokens, EOS, or the token cap.
+
+        Bar tokens are OPENERS: the k-th one starts response-bar k, so n complete
+        bars means stopping just before opener n+1. info["stop"] is "bars"/"eos"
+        for a bar-aligned finish, "max_tokens" if the cap cut it mid-bar."""
+        temperature = temperature if temperature else 1.0
+        top_p = top_p if (top_p and 0 < top_p < 1.0) else 0.9
+        if max_new_tokens is None:
+            max_new_tokens = max(256, 160 * n_bars)
+
+        ids = list(prompt_ids)[-self.max_ctx:]
+        out, bars, notes, stop = [], 0, 0, "max_tokens"
+        for _ in range(max_new_tokens):
+            ctx = torch.tensor([ids[-self.max_ctx:]], dtype=torch.long, device=self.device)
+            logits, _ = self.model(ctx)
+            lg = logits[0, -1].float() / max(temperature, 1e-5)
+            for b in self.banned:
+                lg[b] = float("-inf")
+            probs = torch.softmax(lg, dim=-1)
+            sp, si = torch.sort(probs, descending=True)
+            keep = int((torch.cumsum(sp, -1) < top_p).sum().item()) + 1
+            sp, si = sp[:keep], si[:keep]
+            nxt = int(si[torch.multinomial(sp / sp.sum(), 1)])
+
+            # The jam fine-tune ends every response with EOS; past it the model
+            # is off-distribution, so honouring EOS is what makes n_bars mean
+            # anything. The base model almost never emits it mid-continuation.
+            if self.eos_id is not None and nxt == self.eos_id:
+                stop = "eos"
+                break
+
+            b = self.bars[nxt]
+            if b and bars + b > n_bars and notes >= min_notes:
+                stop = "bars"
+                break  # this id opens bar n_bars+1 — drop it
+            bars += b
+            if self.has_pitch[nxt]:
+                notes += 1
+            out.append(nxt)
+            ids.append(nxt)
+        return out, {"bars": bars, "stop": stop, "n_tokens": len(out), "notes": notes}
+
+    # -------------------------------------------------- public API
 
     def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0):
-        # Load the initial MIDI to use as a structural template
+        # top_k is accepted for API compatibility but unused: the sampler is
+        # temperature + nucleus (top-p) only, matching how the model was tuned.
         template = Score(str(input_midi_path))
         combined = copy.deepcopy(template)
-        
-        # Create an empty template that matches the input's track structure
         extension_only = copy.deepcopy(template)
         for tr in extension_only.tracks:
             tr.notes.clear()
 
-        # Iterate through every track (instrument) and extend them individually
-        for i, tr in enumerate(template.tracks):
-            if len(tr.notes) == 0: continue
-            
-            # Isolate track and tokenize
-            single = copy.deepcopy(template)
-            single.tracks = [tr]
-            tok_seq = self.tokenizer(single)
-            
-            ids = []
-            if isinstance(tok_seq, list):
-                for ts in tok_seq: ids.extend(ts.ids)
-            else:
-                ids = list(tok_seq.ids)
-                
-            # Limit the prompt to the model's context window (last 256 tokens)
-            prompt = ids[-256:] 
-            if not prompt: continue
-            
-            # Execute inference
-            full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k, top_p, max_bar_window=100)
-            cont_ids = full_ids[len(prompt):] # Slice out the prompt, keeping only new tokens
-            if not cont_ids: continue
-            
-            new_tok_seq = TokSequence(ids=[list(t) for t in cont_ids])
-            self.tokenizer.complete_sequence(new_tok_seq)
-            
-            try:
-                # Convert back to symbolic MIDI data
-                cont_score = self.tokenizer.decode([new_tok_seq])
-                if not cont_score.tracks: continue
-                
-                # Synchronize Tick resolutions
-                if cont_score.tpq != combined.tpq:
-                    try: cont_score = cont_score.resample(tpq=combined.tpq)
-                    except: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
-                
-                # Append the newly generated notes into their respective tracks
-                for n in cont_score.tracks[0].notes:
-                    t = getattr(n, 'time', None)
-                    d = getattr(n, 'duration', None)
-                    if t is not None and d is not None and isinstance(t, int) and isinstance(d, int):
-                        combined.tracks[i].notes.append(n)
-                        extension_only.tracks[i].notes.append(copy.deepcopy(n))
-                
-                # Sort events temporally so MIDI parsers do not break
-                combined.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
-                extension_only.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
-            except Exception as e:
-                # Issue: Silently skipping a track can result in missing instruments without the user knowing
-                print(f"Skipping track due to decode error: {e}")
-                
+        # The job router converts a bar count to tokens as bars*32; recover it.
+        n_bars = max(1, int(num_generate) // 32)
+        idx = self._densest_track_idx(template)
+        ids = self._encode_track(template, idx)
+        if not ids:
+            raise ValueError("tokenizer produced no tokens from the input MIDI")
+        prompt = self._last_n_bars(ids, self.PROMPT_BARS)
+        print(f"[REMI] extending track {idx} for {n_bars} bars "
+              f"(prompt: {len(prompt)} tokens, {self._count_bars(prompt)} bars)")
+
+        # Chunked rounds with stall detection: each round continues the rolling
+        # history. The jam fine-tunes answer a few bars per <RESP> cue, so long
+        # extensions are built from several responses.
+        generated, done, stalls = [], 0, 0
+        max_rounds = 4 * (n_bars // self.CHUNK_BARS + 2)
+        for _ in range(max_rounds):
+            if done >= n_bars:
+                break
+            want = min(self.CHUNK_BARS, n_bars - done)
+            hist = self._fit_context(prompt + generated,
+                                     reserve=1 if self.resp_id is not None else 0)
+            if self.resp_id is not None:
+                hist = hist + [self.resp_id]
+            piece, info = self._generate(hist, n_bars=want,
+                                         temperature=temperature, top_p=top_p)
+            if piece:
+                generated.extend(piece)
+                done += max(info["bars"], 0)
+            # A round that closed no bar is a stall even if it produced tokens;
+            # without this the loop can eat the whole budget on structure.
+            stalls = 0 if (piece and info["bars"] > 0) else stalls + 1
+            if stalls >= 3:
+                print("[REMI] generation stalled; stopping early")
+                break
+        if not generated:
+            raise ValueError("model produced no continuation")
+        print(f"[REMI] generated {done}/{n_bars} bars ({len(generated)} tokens)")
+
+        # Decode the continuation ALONE and splice it onto the template at the
+        # next bar line — the source file is preserved (tempo curves, CCs, other
+        # tracks) rather than round-tripped through the tokenizer.
+        cont_score = self._decode(generated)
+        if cont_score.tpq != combined.tpq:
+            try: cont_score = cont_score.resample(tpq=combined.tpq)
+            except Exception: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
+
+        tpb = max(1, int(combined.tpq * _beats_per_bar(template)))
+        src_end = max((n.time + n.duration for tr in template.tracks for n in tr.notes),
+                      default=0)
+        start_tick = ((src_end + tpb - 1) // tpb) * tpb  # next bar line
+        cont_notes = [n for tr in cont_score.tracks for n in tr.notes]
+        cont_notes.sort(key=lambda n: getattr(n, 'time', 0))
+        for n in cont_notes:
+            nn = copy.deepcopy(n)
+            nn.time = nn.time + start_tick
+            combined.tracks[idx].notes.append(nn)
+            extension_only.tracks[idx].notes.append(copy.deepcopy(nn))
+        combined.tracks[idx].notes.sort(key=lambda n: getattr(n, 'time', 0))
+        extension_only.tracks[idx].notes.sort(key=lambda n: getattr(n, 'time', 0))
+
         # Normalize time for the extension-only output so it starts at Time=0
         min_time = min((n.time for tr in extension_only.tracks for n in tr.notes), default=0)
         for tr in extension_only.tracks:
@@ -335,14 +373,540 @@ class AmadeusComposerOctuple:
         full_path = f"{base_path_str}_full.mid"
         ext_path = f"{base_path_str}_extension.mid"
         wav_path = f"{base_path_str}.wav"
-        
+
         combined.dump_midi(full_path)
         extension_only.dump_midi(ext_path)
-        
-        soundfont = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
+        combined.dump_midi(str(output_midi_path))
+
+        soundfont = SOUNDFONT_PATH
         if os.path.exists(soundfont):
             try:
-                subprocess.run(["fluidsynth", "-ni", soundfont, full_path, "-F", wav_path, "-r", "44100"], check=True, stdout=subprocess.DEVNULL)
+                subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"FluidSynth error: {e}")
+
+        return output_midi_path
+
+    def live_extend(self, notes_data, num_generate=64, temperature=0.8, bpm=120):
+        # Real-time jamming endpoint: riff in, bar-aligned answer out.
+        print(f"\n--- [LIVE JAM / REMI] INCOMING REQUEST ---")
+        score = _score_from_live_notes(notes_data, bpm)
+        idx = self._densest_track_idx(score)
+        ids = self._encode_track(score, idx)
+        if not ids: return []
+
+        n_bars = max(1, min(8, int(num_generate) // 32))
+        prompt = self._fit_context(self._last_n_bars(ids, self.PROMPT_BARS),
+                                   reserve=1 if self.resp_id is not None else 0)
+        if self.resp_id is not None:
+            prompt = prompt + [self.resp_id]  # <RESP> is what cues a response
+
+        gen, info = self._generate(prompt, n_bars=n_bars,
+                                   temperature=temperature, top_p=0.9)
+        print(f"[REMI] jam response: {info}")
+        if not gen: return []
+
+        cont_score = self._decode(gen)
+        if cont_score.tpq != 480:
+            try:
+                cont_score = cont_score.resample(tpq=480)
+            except Exception:
+                cont_score = _rescale_score_inplace(cont_score, 480)
+        return _live_notes_response(cont_score)
+
+
+# ─── 2. MULTI-TRACK MODEL (OCTUPLE — RoPE transformer, conditional heads) ────
+# Ported from composertrainingOctuple.ipynb (CELL 1 - MODEL), which produced the
+# deployed Compose_Octuple.pt checkpoint. One step per NOTE; the eight fields of
+# each note are predicted in a fixed order, each head conditioned on the fields
+# already decided for that note (ctx_proj/ctx_norm).
+
+
+class _RoPE(nn.Module):
+    """Rotary position embedding. Relative and extrapolating, so a model trained
+    at SEQ_LEN can generate past it - which is the point of the continuation model."""
+
+    def __init__(self, head_dim, base=10000.0, max_len=8192):
+        super().__init__()
+        inv = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        freqs = torch.outer(torch.arange(max_len).float(), inv)
+        self.register_buffer("cos", freqs.cos()[None, None], persistent=False)
+        self.register_buffer("sin", freqs.sin()[None, None], persistent=False)
+
+    def forward(self, q, k, offset=0):
+        L = q.size(-2)
+        cos = self.cos[..., offset:offset + L, :]
+        sin = self.sin[..., offset:offset + L, :]
+
+        def rot(x):
+            x1, x2 = x[..., ::2], x[..., 1::2]
+            return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), -1).flatten(-2)
+
+        return rot(q), rot(k)
+
+
+class _OctupleBlock(nn.Module):
+    """Pre-norm transformer block with causal SDPA attention and RoPE."""
+
+    def __init__(self, d_model, n_heads, dropout, rope):
+        super().__init__()
+        self.n_heads, self.dropout, self.rope = n_heads, dropout, rope
+        self.norm1 = nn.LayerNorm(d_model)
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.attn_out = nn.Linear(d_model, d_model, bias=False)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model), nn.GELU(),
+            nn.Linear(4 * d_model, d_model), nn.Dropout(dropout),
+        )
+
+    def forward(self, x, offset=0):
+        B, L, D = x.shape
+        h = self.norm1(x)
+        q, k, v = self.qkv(h).chunk(3, dim=-1)
+        q = q.view(B, L, self.n_heads, -1).transpose(1, 2)
+        k = k.view(B, L, self.n_heads, -1).transpose(1, 2)
+        v = v.view(B, L, self.n_heads, -1).transpose(1, 2)
+        q, k = self.rope(q, k, offset)
+        a = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0)
+        x = x + self.attn_out(a.transpose(1, 2).reshape(B, L, D))
+        return x + self.mlp(self.norm2(x))
+
+
+def _octuple_sample_from_logits(logits, temperature, top_p):
+    # logits: (B, vocab). temperature <= 0 means greedy.
+    if temperature <= 0:
+        return logits.argmax(-1)
+    probs = F.softmax(logits / temperature, dim=-1)
+    if top_p is not None and top_p < 1.0:
+        sp, si = probs.sort(dim=-1, descending=True)
+        keep = (sp.cumsum(-1) - sp) < top_p
+        sp = sp * keep
+        sp = sp / sp.sum(-1, keepdim=True).clamp(min=1e-9)
+        return si.gather(-1, torch.multinomial(sp, 1)).squeeze(-1)
+    return torch.multinomial(probs, 1).squeeze(-1)
+
+
+class ComposerOctuple(nn.Module):
+    """~40M params at defaults. One step per NOTE; eight conditional heads per step."""
+
+    def __init__(self, vocab_sizes, head_order, d_model=512, n_layers=12, n_heads=8,
+                 max_seq_len=1024, dropout=0.1, field_dims=None):
+        super().__init__()
+        self.vocab_sizes = list(vocab_sizes)
+        self.num_fields = len(vocab_sizes)
+        self.head_order = list(head_order)
+        assert sorted(self.head_order) == list(range(self.num_fields)), \
+            "head_order must be a permutation of all field indices"
+        self.max_seq_len = max_seq_len
+
+        # Field embedding widths must match the checkpoint exactly, so they are
+        # passed in from the saved weight shapes rather than recomputed.
+        fd = field_dims
+        self.field_dims = fd
+        self.embs = nn.ModuleList(nn.Embedding(v, d) for v, d in zip(vocab_sizes, fd))
+        self.in_proj = nn.Linear(sum(fd), d_model)
+        self.drop = nn.Dropout(dropout)
+
+        rope = _RoPE(d_model // n_heads, max_len=max(4 * max_seq_len, 8192))
+        self.blocks = nn.ModuleList(_OctupleBlock(d_model, n_heads, dropout, rope)
+                                    for _ in range(n_layers))
+        self.norm_f = nn.LayerNorm(d_model)
+
+        # Conditional heads: head f reads the hidden state plus everything already
+        # decided for this note, folded in through ctx_proj.
+        self.heads = nn.ModuleList(nn.Linear(d_model, v) for v in vocab_sizes)
+        self.ctx_proj = nn.ModuleList(nn.Linear(d, d_model, bias=False) for d in fd)
+        self.ctx_norm = nn.ModuleList(nn.LayerNorm(d_model) for _ in fd)
+
+    def encode(self, x, offset=0):
+        e = torch.cat([emb(x[..., i]) for i, emb in enumerate(self.embs)], dim=-1)
+        h = self.drop(self.in_proj(e))
+        for blk in self.blocks:
+            h = blk(h, offset)
+        return self.norm_f(h)
+
+    def forward(self, x, targets=None, offset=0):
+        """targets=None -> hidden states. Otherwise a (1, num_fields) tensor of
+        per-field mean NLL (used by the health check)."""
+        h = self.encode(x, offset)
+        if targets is None:
+            return h
+        losses, ctx = [None] * self.num_fields, h
+        for f in self.head_order:
+            lg = self.heads[f](ctx)
+            losses[f] = F.cross_entropy(lg.float().reshape(-1, lg.size(-1)),
+                                        targets[..., f].reshape(-1))
+            # teacher forcing *within* the step: condition on the true field value
+            ctx = self.ctx_norm[f](ctx + self.ctx_proj[f](self.embs[f](targets[..., f])))
+        return torch.stack(losses).unsqueeze(0)
+
+    @torch.no_grad()
+    def sample_next(self, x, temps, top_p, constraint_fn=None, offset=0):
+        """Sample one complete note. constraint_fn(field, partial) returns a bool
+        mask (B, vocab) of ALLOWED ids, or None. It is called just before each
+        field is sampled and receives the fields already decided for this note,
+        so Position can be masked against the Bar that was just drawn - which is
+        why Bar and Position lead the head order."""
+        ctx = self.encode(x, offset)[:, -1]
+        out = torch.zeros(x.size(0), self.num_fields, dtype=torch.long, device=x.device)
+        for f in self.head_order:
+            lg = self.heads[f](ctx).float()
+            if constraint_fn is not None:
+                m = constraint_fn(f, out)
+                if m is not None:
+                    lg = lg.masked_fill(~m, float("-inf"))
+            nxt = _octuple_sample_from_logits(lg, temps[f], top_p[f])
+            out[:, f] = nxt
+            ctx = self.ctx_norm[f](ctx + self.ctx_proj[f](self.embs[f](nxt)))
+        return out
+
+class AmadeusComposerOctuple:
+    # Per-field sampling defaults: structural fields cold, expressive fields warm.
+    # Sampling Program hot makes the arrangement flicker between instruments.
+    TEMP_SCALE = {"Pitch": 1.0, "Duration": 0.9, "Velocity": 1.0, "Position": 0.8,
+                  "Bar": 0.7, "Program": 0.6, "Tempo": 0.7, "TimeSig": 0.5}
+    PROMPT_NOTES = 256          # notes of context taken from the end of each track
+    MAX_NOTES_PER_TRACK = 1024  # hard cap; the bar target normally stops us first
+    MAX_TRACKS = 8
+
+    def __init__(self, checkpoint_path, tokenizer_path):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Setup MidiTok Octuple tokenizer
+        target_path = Path(tokenizer_path).parent / "Compose_Octuple.json"
+        if target_path.exists():
+            self.tokenizer = Octuple(params=target_path)
+        else:
+            self.tokenizer = Octuple(params=Path(tokenizer_path))
+
+        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        state = {k[7:] if k.startswith("module.") else k: v
+                 for k, v in ckpt.get("model", ckpt).items()}
+        cfg = ckpt.get("config", {}) or {}
+
+        # Architecture is read from the WEIGHT SHAPES, not from cfg: config keys
+        # have drifted between training runs in this project (a stale cfg once
+        # caused a KeyError on 'embed_size') and cfg is advisory only.
+        n_fields = len([k for k in state if k.startswith("embs.") and k.endswith(".weight")])
+        if n_fields == 0:
+            raise ValueError(
+                "Checkpoint is not a ComposerOctuple transformer (no embs.* keys). "
+                f"First keys: {sorted(state)[:8]}")
+        vocab_sizes = [state[f"embs.{i}.weight"].shape[0] for i in range(n_fields)]
+        field_dims = [state[f"embs.{i}.weight"].shape[1] for i in range(n_fields)]
+        n_layers = max(int(k.split(".")[1]) for k in state
+                       if k.startswith("blocks.") and k.split(".")[1].isdigit()) + 1
+        d_model = state["in_proj.weight"].shape[0]
+
+        tok_sizes = [len(v) for v in self.tokenizer.vocab]
+        if tok_sizes != vocab_sizes:
+            raise ValueError(
+                "Tokenizer does not match the checkpoint: checkpoint expects "
+                f"{vocab_sizes}, tokenizer provides {tok_sizes}. They must come "
+                "from the same training run.")
+
+        self.vocab_sizes = vocab_sizes
+        self.num_fields = n_fields
+        self.seq_len = int(cfg.get("seq_len", 1023))  # training window, in NOTES
+
+        self.model = ComposerOctuple(
+            vocab_sizes=vocab_sizes,
+            head_order=cfg.get("head_order", list(range(n_fields))),
+            d_model=d_model, n_layers=n_layers,
+            n_heads=int(cfg.get("n_heads", 8)),
+            max_seq_len=self.seq_len + 1,
+            dropout=0.0, field_dims=field_dims,
+        ).to(self.device)
+        self.model.load_state_dict(state, strict=True)
+        self.model.eval()
+
+        # Field layout: from the training config when present, else detected from
+        # the vocabulary. Column order has moved between miditok releases, so it
+        # is never assumed.
+        fields = cfg.get("fields") or self._detect_fields(self.tokenizer.vocab)
+        self.fields = fields
+        self.idx2name = {i: n for n, i in fields.items()}
+        self.bar_idx = fields["Bar"]
+        self.pos_idx = fields["Position"]
+        self.bar0_id = self.tokenizer.vocab[self.bar_idx]["Bar_0"]
+        self.max_bar = vocab_sizes[self.bar_idx] - self.bar0_id - 1
+
+        # Ban PAD/BOS/EOS/MASK in every field. These ids exist in every vocabulary
+        # and nothing stops the model drawing one; a PAD in the Program field
+        # yields a row miditok cannot decode at all.
+        self.allowed = []
+        for f, voc in enumerate(self.tokenizer.vocab):
+            m = torch.ones(1, vocab_sizes[f], dtype=torch.bool, device=self.device)
+            for t in getattr(self.tokenizer, "special_tokens", []):
+                if t in voc:
+                    m[0, voc[t]] = False
+            self.allowed.append(m)
+
+        print(f"[Octuple] loaded: {n_layers} layers, d_model {d_model}, "
+              f"context {self.seq_len} notes, Bar vocabulary reaches bar {self.max_bar}")
+
+    @staticmethod
+    def _detect_fields(vocabs):
+        names = ["Pitch", "Velocity", "Duration", "Position", "Bar",
+                 "Program", "Tempo", "TimeSig"]
+        out = {}
+        for i, voc in enumerate(vocabs):
+            for n in names:
+                if n not in out and any(str(t).startswith(n + "_") for t in voc):
+                    out[n] = i
+                    break
+        return out
+
+    def _make_constraint_fn(self, last_bar_local, last_pos):
+        """Bar may hold or advance by at most 2 (a skipped bar is a rest, not an
+        error); Position may not move backwards inside the same bar. Specials are
+        banned in every field. Written for batch size 1."""
+        def fn(f, partial):
+            base = self.allowed[f]
+            if f == self.bar_idx:
+                m = torch.zeros_like(base)
+                lo = self.bar0_id + last_bar_local
+                m[0, lo:min(lo + 3, self.vocab_sizes[f])] = True
+                return base & m
+            if f == self.pos_idx and \
+                    int(partial[0, self.bar_idx].item()) - self.bar0_id == last_bar_local:
+                m = base.clone()
+                m[0, :last_pos] = False
+                return m if m.any() else base
+            return base
+        return fn
+
+    @torch.no_grad()
+    def _generate_notes(self, prompt_rows, num_notes, temperature, top_p, until_bar=None):
+        """prompt_rows: (n, num_fields) int array, bars at any offset. The model
+        was trained ONLY on windows re-based to start at Bar_0 (bars_rebased=true
+        in the dataset manifest), so the sliding context is re-based before every
+        forward pass and the shift restored on each generated note. Returns
+        prompt + generated rows in the prompt's original bar frame. until_bar
+        stops once a note lands at/past that bar (same frame as the prompt)."""
+        temperature = temperature if temperature else 0.9
+        top_p = top_p if (top_p and 0 < top_p <= 1.0) else 0.95
+        temps = [temperature * self.TEMP_SCALE.get(self.idx2name.get(i, ""), 1.0)
+                 for i in range(self.num_fields)]
+        tps = [top_p] * self.num_fields
+
+        gen = torch.as_tensor(np.asarray(prompt_rows), dtype=torch.long, device=self.device)
+        ctx_len = self.seq_len + 1
+        for step in range(num_notes):
+            ctx = gen[-ctx_len:]
+            shift = int(ctx[0, self.bar_idx].item()) - self.bar0_id
+            if shift:
+                ctx = ctx.clone()
+                ctx[:, self.bar_idx] -= shift
+            if int(ctx[:, self.bar_idx].max().item()) - self.bar0_id > self.max_bar:
+                print("[Octuple] context spans more bars than the Bar vocabulary; stopping")
+                break
+            last_bar_local = int(ctx[-1, self.bar_idx].item()) - self.bar0_id
+            last_pos = int(ctx[-1, self.pos_idx].item())
+            nxt = self.model.sample_next(
+                ctx.unsqueeze(0), temps, tps,
+                constraint_fn=self._make_constraint_fn(last_bar_local, last_pos))[0].clone()
+            nxt[self.bar_idx] += shift  # local -> the prompt's frame
+            if int(nxt[self.bar_idx].item()) - self.bar0_id > self.max_bar:
+                print(f"[Octuple] reached the last representable bar at note {step}")
+                break
+            gen = torch.cat([gen, nxt.unsqueeze(0)], dim=0)
+            if until_bar is not None and \
+                    int(nxt[self.bar_idx].item()) - self.bar0_id >= until_bar:
+                break
+        out = gen.cpu().numpy()
+        self._check_invariants(out[len(prompt_rows):])
+        return out
+
+    def _check_invariants(self, rows):
+        # The constraints above make violations impossible by construction (except
+        # the rare Position fallback); log loudly rather than crash a request.
+        if len(rows) == 0:
+            return
+        bars = rows[:, self.bar_idx]
+        if (np.diff(bars) < 0).any():
+            print("[Octuple][WARN] invariant violated: bar column decreased")
+        same_bar = np.diff(bars) == 0
+        if ((np.diff(rows[:, self.pos_idx]) < 0) & same_bar).any():
+            print("[Octuple][WARN] invariant violated: position decreased within a bar")
+        for f in range(self.num_fields):
+            allowed = self.allowed[f][0].cpu().numpy()
+            if (~allowed[rows[:, f]]).any():
+                print(f"[Octuple][WARN] invariant violated: special token in "
+                      f"field {self.idx2name.get(f, f)}")
+
+    def _decode_rows(self, rows):
+        ts = TokSequence(ids=[[int(v) for v in r] for r in rows], are_ids_encoded=False)
+        try:
+            return self.tokenizer.decode(ts)
+        except Exception:
+            return self.tokenizer.decode([ts])
+
+    def _loop_drum_notes(self, template, drum_idx, tpq, from_bar, to_bar, loop_bars=4):
+        """Drums are COPIED and looped, never generated - the dataset builder
+        drops drum tracks, so the model has never seen one. Returns notes for
+        absolute bars [from_bar, to_bar], times aligned to the pitched tracks."""
+        src = template.tracks[drum_idx]
+        scale = tpq / template.tpq
+        tpb = tpq * _beats_per_bar(template)
+        loop_ticks = int(tpb * loop_bars)
+        if loop_ticks <= 0:
+            return []
+        pat = [(int(n.time * scale) % loop_ticks, max(int(n.duration * scale), 1),
+                n.pitch, n.velocity)
+               for n in src.notes if int(n.time * scale) < loop_ticks * 4]
+        if not pat:
+            return []
+        out = []
+        from_tick = int(from_bar * tpb)
+        end_tick = int((to_bar + 1) * tpb)
+        start = (int(from_bar) // loop_bars) * loop_ticks
+        while start < end_tick:
+            for off, dur, pitch, vel in pat:
+                t = start + off
+                if from_tick <= t < end_tick:
+                    out.append(Note(time=int(t), duration=int(dur),
+                                    pitch=pitch, velocity=vel))
+            start += loop_ticks
+        return out
+
+    def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0):
+        # top_k is accepted for API compatibility but unused: the conditional-head
+        # sampler filters with per-field temperature + nucleus (top-p) only.
+        template = Score(str(input_midi_path))
+        combined = copy.deepcopy(template)
+
+        # Create an empty template that matches the input's track structure
+        extension_only = copy.deepcopy(template)
+        for tr in extension_only.tracks:
+            tr.notes.clear()
+
+        # The job router converts a bar count to tokens as bars*32; recover it.
+        # Generating to a shared BAR target (not a fixed note count) keeps dense
+        # and sparse tracks ending at the same musical time.
+        continue_bars = max(1, int(num_generate) // 32)
+
+        pitched = [i for i, t in enumerate(template.tracks)
+                   if not t.is_drum and len(t.notes) > 8][:self.MAX_TRACKS]
+        drums = [i for i, t in enumerate(template.tracks)
+                 if t.is_drum and len(t.notes) > 4]
+        if not pitched:
+            raise ValueError("No pitched track has enough notes to extend")
+
+        # Tokenize each pitched track in isolation, keeping ABSOLUTE bar indices
+        prompts = {}
+        for i in pitched:
+            single = copy.deepcopy(template)
+            single.tracks = [template.tracks[i]]
+            try:
+                res = self.tokenizer.encode(single)
+                seq = res[0] if isinstance(res, list) else res
+                a = np.asarray(seq.ids, dtype=np.int64)
+            except Exception as e:
+                print(f"[Octuple] track {i}: encode failed ({e})")
+                continue
+            if a.ndim == 2 and len(a) >= 8:
+                prompts[i] = a[-self.PROMPT_NOTES:]
+        if not prompts:
+            raise ValueError("No pitched track produced a usable Octuple prompt")
+
+        # ONE shared bar offset for every track. Re-basing each track to its own
+        # Bar_0 would shift a late-entering part against the rest of the song.
+        shift = min(int(a[0, self.bar_idx]) - self.bar0_id for a in prompts.values())
+        end_bar = max(int(a[-1, self.bar_idx]) - self.bar0_id
+                      for a in prompts.values()) - shift
+        target = min(end_bar + continue_bars, self.max_bar - max(shift, 0))
+        if target <= end_bar:
+            raise ValueError(
+                f"Song already ends near bar {end_bar + shift} and the Bar "
+                f"vocabulary stops at {self.max_bar} — nothing can be generated")
+        print(f"[Octuple] {len(prompts)} pitched tracks | prompt ends bar "
+              f"{end_bar + shift} -> generating to bar {target + shift}")
+
+        for i, a in prompts.items():
+            a = a.copy()
+            a[:, self.bar_idx] -= shift
+            try:
+                full = self._generate_notes(a, self.MAX_NOTES_PER_TRACK,
+                                            temperature, top_p, until_bar=target)
+            except Exception as e:
+                print(f"[Octuple] track {i}: generation failed ({e})")
+                traceback.print_exc()
+                continue
+            cont = full[len(a):]
+            if len(cont) == 0:
+                continue
+            cont = cont.copy()
+            cont[:, self.bar_idx] += shift  # back to the template's absolute frame
+            cont = cont[cont[:, self.bar_idx] - self.bar0_id <= self.max_bar]
+            if len(cont) == 0:
+                continue
+
+            try:
+                # Octuple bars are absolute, so the continuation rows alone decode
+                # at the correct musical time — no round-trip of the prompt needed,
+                # which preserves the template's tempo curves and CCs.
+                cont_score = self._decode_rows(cont)
+                if not cont_score.tracks:
+                    continue
+
+                # Synchronize tick resolutions (decoded Octuple is ~16 tpq)
+                if cont_score.tpq != combined.tpq:
+                    try: cont_score = cont_score.resample(tpq=combined.tpq)
+                    except Exception: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
+
+                if len(cont_score.tracks) > 1:
+                    print(f"[Octuple] track {i}: decoded into {len(cont_score.tracks)} "
+                          f"tracks (Program varied mid-stream); merging all of them")
+                made = 0
+                for dtr in cont_score.tracks:
+                    for n in dtr.notes:
+                        combined.tracks[i].notes.append(n)
+                        extension_only.tracks[i].notes.append(copy.deepcopy(n))
+                        made += 1
+
+                # Sort events temporally so MIDI parsers do not break
+                combined.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                extension_only.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                print(f"[Octuple] track {i}: {len(a)} prompt + {made} generated notes")
+            except Exception as e:
+                print(f"Skipping track due to decode error: {e}")
+
+        # Loop the first drum track's pattern across the generated bars
+        if drums:
+            di = drums[0]
+            new_drums = self._loop_drum_notes(template, di, combined.tpq,
+                                              from_bar=end_bar + shift + 1,
+                                              to_bar=target + shift)
+            if new_drums:
+                for n in new_drums:
+                    combined.tracks[di].notes.append(n)
+                    extension_only.tracks[di].notes.append(copy.deepcopy(n))
+                combined.tracks[di].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                extension_only.tracks[di].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                print(f"[Octuple] drums: looped {len(new_drums)} notes across the extension")
+
+        # Normalize time for the extension-only output so it starts at Time=0
+        min_time = min((n.time for tr in extension_only.tracks for n in tr.notes), default=0)
+        for tr in extension_only.tracks:
+            for n in tr.notes: n.time -= min_time
+
+        # Path Setup & Export
+        base_path_str = str(output_midi_path).replace(".mid", "")
+        full_path = f"{base_path_str}_full.mid"
+        ext_path = f"{base_path_str}_extension.mid"
+        wav_path = f"{base_path_str}.wav"
+
+        combined.dump_midi(full_path)
+        extension_only.dump_midi(ext_path)
+        combined.dump_midi(str(output_midi_path))
+
+        soundfont = SOUNDFONT_PATH
+        if os.path.exists(soundfont):
+            try:
+                subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
             except Exception as e:
                 print(f"FluidSynth error: {e}")
 
@@ -350,77 +914,33 @@ class AmadeusComposerOctuple:
 
     def live_extend(self, notes_data, num_generate=64, temperature=0.8, bpm=120):
         # Real-time jamming endpoint. Designed to be stateless and fast.
-        print(f"\n--- [LIVE JAM] INCOMING REQUEST ---")
-        
-        # 1. Create a dummy Score object to hold incoming browser data
-        raw_score = Score(480) 
-        raw_score.tempos.append(Tempo(time=0, qpm=bpm))
-        raw_score.time_signatures.append(TimeSignature(time=0, numerator=4, denominator=4))
-        
-        track = Track(program=0, is_drum=False, name="LiveJam")
-        for nd in notes_data:
-            track.notes.append(Note(
-                time=int(nd['time']), 
-                duration=int(nd['duration']), 
-                pitch=int(nd['pitch']), 
-                velocity=int(nd['velocity'])
-            ))
-            
-        track.notes.sort(key=lambda n: getattr(n, 'time', 0))
-        raw_score.tracks.append(track)
-        
-        # 2. Write to a temporary file (Symusic requires file I/O for instantiation)
-        fd, path = tempfile.mkstemp(suffix=".mid")
-        os.close(fd)
-        raw_score.dump_midi(path)
-        
-        score = Score(path)
-        os.remove(path) # Cleanup immediately
-        
-        # 3. Tokenize input sequence
-        tok_seq = self.tokenizer(score)
-        ids = []
-        if isinstance(tok_seq, list):
-            for ts in tok_seq: ids.extend(ts.ids)
-        else:
-            ids = list(tok_seq.ids)
-            
-        prompt = ids[-256:]
-        if not prompt: return []
-        
-        # 4. Generate new notes and isolate the continuation
-        full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k=0, top_p=0.95, max_bar_window=100)
-        cont_ids = full_ids[len(prompt):]
-        if not cont_ids: return []
-        
-        new_tok_seq = TokSequence(ids=[list(t) for t in cont_ids])
-        self.tokenizer.complete_sequence(new_tok_seq)
-        
-        # 5. Decode back to symbolic notes and format as JSON array for the frontend
-        cont_score = self.tokenizer.decode([new_tok_seq])
+        print(f"\n--- [LIVE JAM / OCTUPLE] INCOMING REQUEST ---")
+        score = _score_from_live_notes(notes_data, bpm)
+
+        # Tokenize input sequence (one Octuple row per note)
+        tok_seq = self.tokenizer.encode(score)
+        seq = tok_seq[0] if isinstance(tok_seq, list) else tok_seq
+        rows = np.asarray(seq.ids, dtype=np.int64)
+        if rows.ndim != 2 or len(rows) == 0: return []
+        prompt = rows[-self.PROMPT_NOTES:]
+
+        # Generate new notes (one note per step) and isolate the continuation.
+        # _generate_notes re-bases the context internally, so absolute offsets in
+        # the incoming clip are handled correctly.
+        full = self._generate_notes(prompt, num_generate or 64, temperature, top_p=0.95)
+        cont = full[len(prompt):]
+        if len(cont) == 0: return []
+
+        # Decode back to symbolic notes and format as JSON array for the frontend
+        cont_score = self._decode_rows(cont)
         if not cont_score.tracks: return []
-        
+
         if cont_score.tpq != 480:
-            try: 
+            try:
                 cont_score = cont_score.resample(tpq=480)
-            except: 
+            except:
                 cont_score = _rescale_score_inplace(cont_score, 480)
-                
-        response_notes = []
-        raw_notes = cont_score.tracks[0].notes
-        
-        if len(raw_notes) > 0:
-            min_time = min(getattr(n, 'time', 0) for n in raw_notes)
-            for n in raw_notes:
-                n_time = getattr(n, 'time', 0)
-                response_notes.append({
-                    "pitch": getattr(n, 'pitch', 60),
-                    "time": n_time - min_time, # Normalize time for instant playback
-                    "duration": getattr(n, 'duration', 120),
-                    "velocity": getattr(n, 'velocity', 80)
-                })
-                    
-        return response_notes
+        return _live_notes_response(cont_score)
 
 # ─── 3. GPT-STYLE MODEL (TSD) ──────────────────────────────────────────────
 
@@ -636,10 +1156,10 @@ class AmadeusComposerTSD:
         combined.dump_midi(full_path)
         extension_only.dump_midi(ext_path)
         
-        soundfont = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
+        soundfont = SOUNDFONT_PATH
         if os.path.exists(soundfont):
             try:
-                subprocess.run(["fluidsynth", "-ni", soundfont, full_path, "-F", wav_path, "-r", "44100"], check=True, stdout=subprocess.DEVNULL)
+                subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
             except Exception as e:
                 print(f"FluidSynth error: {e}")
 

@@ -146,8 +146,10 @@ export default function LiveExtend() {
   // Jam States
   const [currentRecording, setCurrentRecording] = useState<JamNote[]>([]);
   const [activeKeys, setActiveKeys] = useState<number[]>([]);
-  const [temperature, setTemperature] = useState([0.85]); 
+  const [temperature, setTemperature] = useState([0.85]);
   const [numGenerate, setNumGenerate] = useState([64]);
+  const [autoTokens, setAutoTokens] = useState(true); // match answer length to the notes played
+  const [jamModel, setJamModel] = useState("octuple");
   const [topK, setTopK] = useState([0]);
   const [topP, setTopP] = useState([0.95]);
 
@@ -175,7 +177,19 @@ export default function LiveExtend() {
   const pressedKeysRef = useRef<Set<string>>(new Set());
   const callbacksRef = useRef({ playNote: (p: number) => {}, stopNote: (p: number) => {} });
 
+  // Auto-jam engine: recording starts on the first note played and the take is
+  // sent after SILENCE_MS of no input with no keys held. Mirror refs keep the
+  // timer callbacks free of stale state (same pattern as bpmRef/callbacksRef).
+  const SILENCE_MS = 2500;
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const isRecordingRef = useRef(false);
+  const isWaitingRef = useRef(false);
+  const stopAndSendRef = useRef<() => void>(() => {});
+
   useEffect(() => { bpmRef.current = bpm[0]; }, [bpm]);
+  useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
+  useEffect(() => { isWaitingRef.current = isWaitingForAI; }, [isWaitingForAI]);
+  useEffect(() => () => { if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current); }, []);
 
   const logSystem = (msg: string) => {
     const timestamp = new Date().toISOString().split('T')[1].slice(0, 12);
@@ -199,21 +213,54 @@ export default function LiveExtend() {
     }
   };
 
+  // --- AUTO-JAM SILENCE DETECTION ---
+  const checkSilence = () => {
+    if (!isRecordingRef.current) return;
+    // A held key or an in-flight AI request postpones the send.
+    if (activeNotesMap.current.size > 0 || pressedKeysRef.current.size > 0 || isWaitingRef.current) {
+      armSilenceTimer(500);
+      return;
+    }
+    stopAndSendRef.current();
+  };
+
+  const armSilenceTimer = (ms: number = SILENCE_MS) => {
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    silenceTimerRef.current = setTimeout(checkSilence, ms);
+  };
+
   // --- PLAYBACK CONTROLS ---
   const playNote = (pitch: number) => {
     if (!instrument.current || !audioContext.current) return;
     instrument.current.play(pitch.toString(), audioContext.current.currentTime, { duration: 2 });
     setActiveKeys((prev) => [...prev, pitch]);
 
-    if (isRecording) {
+    // Auto-record: the first note played starts a new take — no Record button.
+    // The ref (not state) is read because it updates synchronously — the note
+    // that triggers the start must be captured too, before React re-renders.
+    let recording = isRecordingRef.current;
+    if (!recording) {
+      setCurrentRecording([]);
+      activeNotesMap.current.clear();
+      recordingStartTime.current = Date.now();
+      setIsRecording(true);
+      isRecordingRef.current = true;
+      recording = true;
+      logSystem(`[SYS] Auto-record started at ${bpm[0]} BPM.`);
+    }
+
+    if (recording) {
       const startTimeMs = Date.now() - recordingStartTime.current;
       activeNotesMap.current.set(pitch, startTimeMs);
     }
+    armSilenceTimer();
   };
 
   const stopNote = (pitch: number) => {
     setActiveKeys((prev) => prev.filter((p) => p !== pitch));
-    if (isRecording && activeNotesMap.current.has(pitch)) {
+    // Ref, not state: a fast tap can release before React re-renders the
+    // auto-started recording, and that first note must not be dropped.
+    if (isRecordingRef.current && activeNotesMap.current.has(pitch)) {
       const startTimeMs = activeNotesMap.current.get(pitch)!;
       const durationMs = (Date.now() - recordingStartTime.current) - startTimeMs;
       activeNotesMap.current.delete(pitch);
@@ -222,20 +269,13 @@ export default function LiveExtend() {
         ...prev,
         {
           pitch,
-          time: msToTicks(startTimeMs, bpm[0]), 
-          duration: Math.max(msToTicks(durationMs, bpm[0]), 60), 
-          velocity: 80, 
+          time: msToTicks(startTimeMs, bpm[0]),
+          duration: Math.max(msToTicks(durationMs, bpm[0]), 60),
+          velocity: 80,
         },
       ]);
     }
-  };
-
-  const startRecording = () => {
-    setCurrentRecording([]);
-    activeNotesMap.current.clear();
-    recordingStartTime.current = Date.now();
-    setIsRecording(true);
-    logSystem(`[SYS] Recording started at ${bpm[0]} BPM. Metronome: ${metronomeOn ? "ON" : "OFF"}`);
+    armSilenceTimer();
   };
 
   useEffect(() => { callbacksRef.current = { playNote, stopNote }; }, [playNote, stopNote]);
@@ -349,9 +389,12 @@ export default function LiveExtend() {
 
   // --- INFERENCE PIPELINE ---
   const stopAndSend = async () => {
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     setIsRecording(false);
-    setMetronomeOn(false);
-    
+    isRecordingRef.current = false;
+    // The metronome intentionally keeps running: in a continuous jam the shared
+    // clock must survive across turns.
+
     if (currentRecording.length === 0) {
       toast({ variant: "destructive", title: "Empty Recording", description: "You need to play some notes before sending!" });
       return;
@@ -368,20 +411,27 @@ export default function LiveExtend() {
     setMessages((prev) => [...prev, userMsg]);
     setCurrentRecording([]);
 
+    // Auto mode answers with roughly as many tokens as notes were played
+    // (clamped to the slider's own range); otherwise the slider value is used.
+    const tokensToRequest = autoTokens
+      ? Math.min(128, Math.max(16, userMsg.notes.length))
+      : numGenerate[0];
+
     setIsWaitingForAI(true);
     try {
-      logSystem(`[NET] Initiating POST /api/jam (tokens: ${numGenerate[0]}, temp: ${temperature[0]})...`);
-      
+      logSystem(`[NET] Initiating POST /api/jam (tokens: ${tokensToRequest}${autoTokens ? " [auto]" : ""}, temp: ${temperature[0]})...`);
+
       const response = await fetch("/api/jam", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          notes: userMsg.notes, 
-          num_generate: numGenerate[0], 
+        body: JSON.stringify({
+          notes: userMsg.notes,
+          num_generate: tokensToRequest,
           temperature: temperature[0],
           top_k: topK[0],
           top_p: topP[0],
-          bpm: bpm[0] 
+          bpm: bpm[0],
+          model: jamModel
         }),
       });
 
@@ -400,6 +450,8 @@ export default function LiveExtend() {
           timestamp: new Date(),
         };
         setMessages((prev) => [...prev, aiMsg]);
+        // Auto-play the answer so the jam continues without a click.
+        playMessage(aiMsg.id, aiNotes);
       } else {
         logSystem(`[ERR] Transformer returned empty sequence.`);
         toast({ title: "AI was silent", description: "The model returned no notes." });
@@ -443,7 +495,13 @@ export default function LiveExtend() {
     sortedNotes.forEach((n) => {
       const startTimeSec = ticksToMs(n.time - minTime, bpm[0]) / 1000;
       const durationSec = ticksToMs(n.duration, bpm[0]) / 1000;
-      instrument.current!.play(n.pitch.toString(), now + startTimeSec, { duration: durationSec });
+      // Let the piano sample ring out like live input does (live uses a flat 2s):
+      // hard-cutting a piano sample at a short tap duration sounds like a synth pluck.
+      instrument.current!.play(n.pitch.toString(), now + startTimeSec, {
+        duration: Math.max(durationSec, 1.5),
+        release: 0.4,
+        gain: (n.velocity ?? 80) / 100,
+      });
       if (startTimeSec + durationSec > maxDurationSec) maxDurationSec = startTimeSec + durationSec;
     });
 
@@ -451,6 +509,10 @@ export default function LiveExtend() {
       setPlayingMessageId(null);
     }, (maxDurationSec + 0.5) * 1000);
   };
+
+  // Keep the silence timer pointed at the freshest closure — state inside
+  // stopAndSend would otherwise be stale when the timer fires.
+  useEffect(() => { stopAndSendRef.current = stopAndSend; });
 
   const playStitchedSession = () => {
     if (!isReady || !instrument.current || !audioContext.current) return;
@@ -475,8 +537,14 @@ export default function LiveExtend() {
       sorted.forEach((n) => {
         const startTimeSec = ticksToMs(n.time - minTime, bpm[0]) / 1000;
         const durationSec = ticksToMs(n.duration, bpm[0]) / 1000;
-        instrument.current!.play(n.pitch.toString(), now + startTimeSec, { duration: durationSec });
-        
+        // Same natural ring-out as live input; chunk spacing below still uses
+        // the musical durationSec, so timing between chunks is unchanged.
+        instrument.current!.play(n.pitch.toString(), now + startTimeSec, {
+          duration: Math.max(durationSec, 1.5),
+          release: 0.4,
+          gain: (n.velocity ?? 80) / 100,
+        });
+
         const noteEndTime = startTimeSec + durationSec;
         if (noteEndTime > maxTimeInMsg) maxTimeInMsg = noteEndTime;
       });
@@ -621,6 +689,20 @@ export default function LiveExtend() {
                 
                 {/* Parameters Grid */}
                 <div className="grid grid-cols-2 gap-6 p-5 bg-secondary/10 rounded-lg border border-border/50 shadow-inner">
+                  <div className="space-y-3 col-span-2 group">
+                    <label className="text-sm font-medium group-hover:text-primary transition-colors">AI Jam Partner</label>
+                    <select
+                      value={jamModel}
+                      onChange={(e) => setJamModel(e.target.value)}
+                      className="flex h-10 w-full rounded-md border border-input bg-background/50 backdrop-blur-sm px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                    >
+                      <option value="octuple">Multi-Track Model (Octuple)</option>
+                      <option value="remi">Standard Model (REMI)</option>
+                      <option value="remi_classical">Classical Model (REMI Fine-Tune)</option>
+                      <option value="remi_movies">Movie Score Model (REMI Fine-Tune)</option>
+                    </select>
+                  </div>
+
                   <div className="space-y-3 group">
                     <div className="flex items-center justify-between text-sm">
                       <label className="font-medium group-hover:text-primary transition-colors">Temperature</label>
@@ -631,10 +713,25 @@ export default function LiveExtend() {
                   
                   <div className="space-y-3 group">
                     <div className="flex items-center justify-between text-sm">
-                      <label className="font-medium group-hover:text-primary transition-colors">Tokens</label>
-                      <span className="font-mono text-muted-foreground bg-primary/10 px-2 py-0.5 rounded">{numGenerate[0]}</span>
+                      <div className="flex items-center gap-2">
+                        <label className="font-medium group-hover:text-primary transition-colors">Tokens</label>
+                        <label className="flex items-center gap-1 text-xs text-muted-foreground cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={autoTokens}
+                            onChange={(e) => setAutoTokens(e.target.checked)}
+                            className="accent-primary w-3.5 h-3.5 cursor-pointer"
+                          />
+                          Auto
+                        </label>
+                      </div>
+                      <span className="font-mono text-muted-foreground bg-primary/10 px-2 py-0.5 rounded">
+                        {autoTokens ? "auto" : numGenerate[0]}
+                      </span>
                     </div>
-                    <Slider value={numGenerate} onValueChange={setNumGenerate} min={16} max={128} step={16} />
+                    <div className={autoTokens ? "opacity-40 pointer-events-none" : ""}>
+                      <Slider value={numGenerate} onValueChange={setNumGenerate} min={16} max={128} step={16} disabled={autoTokens} />
+                    </div>
                   </div>
                   
                   <div className="space-y-3 group">
@@ -673,21 +770,27 @@ export default function LiveExtend() {
                   </div>
                 </div>
 
-                {/* Primary Action Buttons */}
+                {/* Auto-Jam Status Strip: recording starts when the user plays
+                    and sends itself after a short pause — no required clicks. */}
                 <div className="flex items-center justify-between pt-2">
-                  <div className="flex gap-2">
-                    {!isRecording ? (
-                      <Button onClick={startRecording} className="w-32 gap-2 bg-red-500 hover:bg-red-600 shadow-md shadow-red-500/20 text-white transition-all">
-                        <Mic className="w-4 h-4" /> Record
-                      </Button>
-                    ) : (
-                      // VISUALS: Pulsing effect while recording
-                      <Button onClick={stopAndSend} className="w-32 gap-2 bg-primary hover:bg-primary/90 shadow-md shadow-primary/30 animate-pulse transition-all">
-                        <Square className="w-4 h-4 fill-current" /> Stop & Send
-                      </Button>
+                  <div className="flex items-center gap-2">
+                    {!isRecording && !isWaitingForAI && (
+                      <div className="flex items-center gap-2 text-muted-foreground text-sm font-semibold bg-secondary/30 px-3 py-1.5 rounded-full">
+                        <Mic className="w-4 h-4" /> Listening — just start playing
+                      </div>
+                    )}
+                    {isRecording && (
+                      <>
+                        <div className="flex items-center gap-2 text-red-500 text-sm font-semibold animate-pulse bg-red-500/10 px-3 py-1.5 rounded-full">
+                          <Mic className="w-4 h-4" /> Recording — pause to send
+                        </div>
+                        <Button size="sm" onClick={stopAndSend} className="gap-2 bg-primary hover:bg-primary/90 shadow-md shadow-primary/30 transition-all">
+                          <Square className="w-3 h-3 fill-current" /> Send now
+                        </Button>
+                      </>
                     )}
                   </div>
-                  
+
                   {isWaitingForAI && (
                     <div className="flex items-center gap-2 text-primary text-sm font-semibold animate-pulse bg-primary/10 px-3 py-1.5 rounded-full">
                       <Activity className="w-4 h-4" /> Neural inference running...

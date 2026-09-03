@@ -11,6 +11,7 @@ import Transform from "@/pages/transform";
 import Evaluate from "@/pages/evaluate";
 import LiveExtend from "@/pages/live";
 import Jobs from "@/pages/jobs";
+import Showcase from "@/pages/showcase";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -30,6 +31,7 @@ function Router() {
         <Route path="/transform" component={Transform} />
         <Route path="/evaluate" component={Evaluate} />
         <Route path="/live" component={LiveExtend} />
+        <Route path="/showcase" component={Showcase} />
         <Route path="/jobs" component={Jobs} />
         <Route component={NotFound} />
       </Switch>

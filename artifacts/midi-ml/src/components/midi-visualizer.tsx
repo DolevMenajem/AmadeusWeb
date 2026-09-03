@@ -5,7 +5,8 @@ import { Midi } from "@tonejs/midi";
 
 interface MidiVisualizerProps {
   midiUrl: string;
-  inputMidiUrl?: string; // NEW: The seed file for seam calculation
+  inputMidiUrl?: string; // The seed file for seam calculation
+  seamTime?: number;     // Explicit seam (seconds); wins over inputMidiUrl detection
   audioElement: HTMLAudioElement | null;
   color?: string;
 }
@@ -17,7 +18,7 @@ interface ExtractedNote {
   color: string;
 }
 
-export function MidiVisualizer({ midiUrl, inputMidiUrl, audioElement, color = "#3b82f6" }: MidiVisualizerProps) {
+export function MidiVisualizer({ midiUrl, inputMidiUrl, seamTime, audioElement, color = "#3b82f6" }: MidiVisualizerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [notes, setNotes] = useState<ExtractedNote[]>([]);
   const [seamTimeSec, setSeamTimeSec] = useState<number | null>(null);
@@ -33,10 +34,17 @@ export function MidiVisualizer({ midiUrl, inputMidiUrl, audioElement, color = "#
         const arrayBuffer = await response.arrayBuffer();
         const parsedMidi = new Midi(arrayBuffer);
         
-        let detectedSeam = null;
+        let detectedSeam: number | null = null;
 
-        // 2. Fetch the original seed file to find the exact AI Takeover timestamp
-        if (inputMidiUrl) {
+        // 2a. An explicitly provided seam time wins (showcase page computes it
+        // from an extension-only file when no seed file is available)
+        if (seamTime != null) {
+          detectedSeam = seamTime;
+          if (isMounted) setSeamTimeSec(seamTime);
+        }
+
+        // 2b. Otherwise fetch the original seed file to find the AI Takeover timestamp
+        if (detectedSeam === null && inputMidiUrl) {
           try {
             const inRes = await fetch(inputMidiUrl);
             if (inRes.ok) {
@@ -93,7 +101,7 @@ export function MidiVisualizer({ midiUrl, inputMidiUrl, audioElement, color = "#
 
     fetchMidiData();
     return () => { isMounted = false; };
-  }, [midiUrl, inputMidiUrl, color]);
+  }, [midiUrl, inputMidiUrl, seamTime, color]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
