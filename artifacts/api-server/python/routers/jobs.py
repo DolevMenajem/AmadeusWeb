@@ -277,8 +277,11 @@ async def simulate_processing(job_id: int, job_type: str, target_genre: str | No
                 if isinstance(generated_paths, list):
                     if len(generated_paths) > 1:
                         stored_output = json.dumps([os.path.basename(p) for p in generated_paths])
-                    else:
+                    elif len(generated_paths) == 1:
                         stored_output = os.path.basename(generated_paths[0])
+                    else:
+                        # NEW: Fallback if the AI returned an empty list (generation failed)
+                        stored_output = output_filename
                 else:
                     stored_output = output_filename
             else:

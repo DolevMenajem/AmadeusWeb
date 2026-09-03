@@ -431,7 +431,7 @@ export default function Extend() {
                             ref={setAudioEl}
                             controls
                             className="w-full h-10 rounded-md shadow-sm"
-                            src={`/api/jobs/${job.id}/download?type=audio`}
+                            src={`/api/jobs/${job.id}/download?type=audio&variation=${selectedVariation}`} // <-- FIX ADDED HERE
                             controlsList="nodownload"
                             onError={() => setWavFailed(true)}
                           >
@@ -440,7 +440,7 @@ export default function Extend() {
                         ) : (
                           // No server-side WAV render available — play the MIDI
                           // in the browser with the piano sampler instead.
-                          <MidiPlayer compact url={`/api/jobs/${job.id}/download?type=full`} label="Piano preview (in-browser render)" />
+                          <MidiPlayer compact url={`/api/jobs/${job.id}/download?type=full&variation=${selectedVariation}`} label="Piano preview (in-browser render)" /> // <-- FIX ADDED HERE
                         )}
                       </div>
 

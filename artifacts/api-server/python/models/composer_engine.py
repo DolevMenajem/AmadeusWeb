@@ -295,98 +295,128 @@ class AmadeusComposerREMI:
 
     # -------------------------------------------------- public API
 
-    def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0):
+    def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0, num_variations=1):
+        """
+        Executes the auto-regressive generation pipeline utilizing the REMI tokenization strategy.
+        REMI (Revamped MIDI) encodes music as a 1D sequence of events. We generate multiple 
+        stochastic variations by looping the chunked-generation and decoding pipeline.
+        """
         # top_k is accepted for API compatibility but unused: the sampler is
         # temperature + nucleus (top-p) only, matching how the model was tuned.
         template = Score(str(input_midi_path))
-        combined = copy.deepcopy(template)
-        extension_only = copy.deepcopy(template)
-        for tr in extension_only.tracks:
-            tr.notes.clear()
 
+        # 1. PROMPT PREPARATION
         # The job router converts a bar count to tokens as bars*32; recover it.
         n_bars = max(1, int(num_generate) // 32)
         idx = self._densest_track_idx(template)
         ids = self._encode_track(template, idx)
         if not ids:
             raise ValueError("tokenizer produced no tokens from the input MIDI")
+            
         prompt = self._last_n_bars(ids, self.PROMPT_BARS)
         print(f"[REMI] extending track {idx} for {n_bars} bars "
-              f"(prompt: {len(prompt)} tokens, {self._count_bars(prompt)} bars)")
+              f"(prompt: {len(prompt)} tokens, {self._count_bars(prompt)} bars) -> {num_variations} variations")
 
-        # Chunked rounds with stall detection: each round continues the rolling
-        # history. The jam fine-tunes answer a few bars per <RESP> cue, so long
-        # extensions are built from several responses.
-        generated, done, stalls = [], 0, 0
-        max_rounds = 4 * (n_bars // self.CHUNK_BARS + 2)
-        for _ in range(max_rounds):
-            if done >= n_bars:
-                break
-            want = min(self.CHUNK_BARS, n_bars - done)
-            hist = self._fit_context(prompt + generated,
-                                     reserve=1 if self.resp_id is not None else 0)
-            if self.resp_id is not None:
-                hist = hist + [self.resp_id]
-            piece, info = self._generate(hist, n_bars=want,
-                                         temperature=temperature, top_p=top_p)
-            if piece:
-                generated.extend(piece)
-                done += max(info["bars"], 0)
-            # A round that closed no bar is a stall even if it produced tokens;
-            # without this the loop can eat the whole budget on structure.
-            stalls = 0 if (piece and info["bars"] > 0) else stalls + 1
-            if stalls >= 3:
-                print("[REMI] generation stalled; stopping early")
-                break
-        if not generated:
-            raise ValueError("model produced no continuation")
-        print(f"[REMI] generated {done}/{n_bars} bars ({len(generated)} tokens)")
-
-        # Decode the continuation ALONE and splice it onto the template at the
-        # next bar line — the source file is preserved (tempo curves, CCs, other
-        # tracks) rather than round-tripped through the tokenizer.
-        cont_score = self._decode(generated)
-        if cont_score.tpq != combined.tpq:
-            try: cont_score = cont_score.resample(tpq=combined.tpq)
-            except Exception: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
-
-        tpb = max(1, int(combined.tpq * _beats_per_bar(template)))
-        src_end = max((n.time + n.duration for tr in template.tracks for n in tr.notes),
-                      default=0)
-        start_tick = ((src_end + tpb - 1) // tpb) * tpb  # next bar line
-        cont_notes = [n for tr in cont_score.tracks for n in tr.notes]
-        cont_notes.sort(key=lambda n: getattr(n, 'time', 0))
-        for n in cont_notes:
-            nn = copy.deepcopy(n)
-            nn.time = nn.time + start_tick
-            combined.tracks[idx].notes.append(nn)
-            extension_only.tracks[idx].notes.append(copy.deepcopy(nn))
-        combined.tracks[idx].notes.sort(key=lambda n: getattr(n, 'time', 0))
-        extension_only.tracks[idx].notes.sort(key=lambda n: getattr(n, 'time', 0))
-
-        # Normalize time for the extension-only output so it starts at Time=0
-        min_time = min((n.time for tr in extension_only.tracks for n in tr.notes), default=0)
-        for tr in extension_only.tracks:
-            for n in tr.notes: n.time -= min_time
-
-        # Path Setup & Export
+        generated_files = []
         base_path_str = str(output_midi_path).replace(".mid", "")
-        full_path = f"{base_path_str}_full.mid"
-        ext_path = f"{base_path_str}_extension.mid"
-        wav_path = f"{base_path_str}.wav"
 
-        combined.dump_midi(full_path)
-        extension_only.dump_midi(ext_path)
-        combined.dump_midi(str(output_midi_path))
+        # 2. STOCHASTIC VARIATION LOOP
+        for v_idx in range(num_variations):
+            var_suffix = f"_var{v_idx+1}" if num_variations > 1 else ""
+            
+            # Deep copy the structural templates so each variation starts fresh
+            combined = copy.deepcopy(template)
+            extension_only = copy.deepcopy(template)
+            for tr in extension_only.tracks:
+                tr.notes.clear()
 
-        soundfont = SOUNDFONT_PATH
-        if os.path.exists(soundfont):
-            try:
-                subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
-            except Exception as e:
-                print(f"FluidSynth error: {e}")
+            # Chunked rounds with stall detection: each round continues the rolling
+            # history. The jam fine-tunes answer a few bars per <RESP> cue, so long
+            # extensions are built from several iterative responses.
+            generated, done, stalls = [], 0, 0
+            max_rounds = 4 * (n_bars // self.CHUNK_BARS + 2)
+            
+            # 3. AUTO-REGRESSIVE GENERATION (CHUNKED)
+            for _ in range(max_rounds):
+                if done >= n_bars:
+                    break
+                want = min(self.CHUNK_BARS, n_bars - done)
+                hist = self._fit_context(prompt + generated,
+                                         reserve=1 if self.resp_id is not None else 0)
+                if self.resp_id is not None:
+                    hist = hist + [self.resp_id]
+                    
+                piece, info = self._generate(hist, n_bars=want,
+                                             temperature=temperature, top_p=top_p)
+                if piece:
+                    generated.extend(piece)
+                    done += max(info["bars"], 0)
+                    
+                # Stall Detection: A round that closed no bar is a stall even if it produced tokens;
+                # without this, the loop can eat the whole sequence budget on metadata structure.
+                stalls = 0 if (piece and info["bars"] > 0) else stalls + 1
+                if stalls >= 3:
+                    print(f"[REMI] Var {v_idx+1} generation stalled; stopping early")
+                    break
+                    
+            if not generated:
+                print(f"[REMI] Var {v_idx+1} model produced no continuation")
+                continue
+                
+            print(f"[REMI] Var {v_idx+1} generated {done}/{n_bars} bars ({len(generated)} tokens)")
 
-        return output_midi_path
+            # 4. DECODING & SYMBOLIC RECONSTRUCTION
+            # Decode the continuation ALONE and splice it onto the template at the
+            # next bar line — the source file is preserved (tempo curves, CCs, other
+            # tracks) rather than round-tripped through the tokenizer.
+            cont_score = self._decode(generated)
+            if cont_score.tpq != combined.tpq:
+                try: cont_score = cont_score.resample(tpq=combined.tpq)
+                except Exception: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
+
+            # Mathematical alignment: Calculate the exact tick where the next measure begins
+            tpb = max(1, int(combined.tpq * _beats_per_bar(template)))
+            src_end = max((n.time + n.duration for tr in template.tracks for n in tr.notes),
+                          default=0)
+            start_tick = ((src_end + tpb - 1) // tpb) * tpb  # Snaps to the next bar line
+            
+            cont_notes = [n for tr in cont_score.tracks for n in tr.notes]
+            cont_notes.sort(key=lambda n: getattr(n, 'time', 0))
+            
+            # Splice the generated notes directly into the target track
+            for n in cont_notes:
+                nn = copy.deepcopy(n)
+                nn.time = nn.time + start_tick
+                combined.tracks[idx].notes.append(nn)
+                extension_only.tracks[idx].notes.append(copy.deepcopy(nn))
+                
+            combined.tracks[idx].notes.sort(key=lambda n: getattr(n, 'time', 0))
+            extension_only.tracks[idx].notes.sort(key=lambda n: getattr(n, 'time', 0))
+
+            # 5. TEMPORAL NORMALIZATION
+            # Normalize time for the extension-only output so it starts at Time=0
+            min_time = min((n.time for tr in extension_only.tracks for n in tr.notes), default=0)
+            for tr in extension_only.tracks:
+                for n in tr.notes: n.time -= min_time
+
+            # 6. PHYSICAL FILE EXPORT & AUDIO SYNTHESIS
+            full_path = f"{base_path_str}{var_suffix}_full.mid"
+            ext_path = f"{base_path_str}{var_suffix}_extension.mid"
+            wav_path = f"{base_path_str}{var_suffix}.wav"
+
+            combined.dump_midi(full_path)
+            extension_only.dump_midi(ext_path)
+
+            soundfont = SOUNDFONT_PATH
+            if os.path.exists(soundfont):
+                try:
+                    subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
+                except Exception as e:
+                    print(f"FluidSynth error: {e}")
+
+            generated_files.append(f"{base_path_str}{var_suffix}.mid")
+
+        return generated_files
 
     def live_extend(self, notes_data, num_generate=64, temperature=0.8, bpm=120):
         # Real-time jamming endpoint: riff in, bar-aligned answer out.
@@ -773,17 +803,17 @@ class AmadeusComposerOctuple:
             start += loop_ticks
         return out
 
-    def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0):
+    def extend_midi(self, input_midi_path, output_midi_path, num_generate=256, temperature=0.8, top_k=0, top_p=1.0, num_variations=1):
+        """
+        Executes the multi-track inference pipeline utilizing the Octuple tokenization strategy.
+        Octuple employs multi-dimensional tokens (Pitch, Velocity, Duration, Position, Bar, etc.) 
+        simultaneously at each time step. We generate multiple stochastic variations by looping
+        the core generation and decoding pipeline.
+        """
         # top_k is accepted for API compatibility but unused: the conditional-head
         # sampler filters with per-field temperature + nucleus (top-p) only.
         template = Score(str(input_midi_path))
-        combined = copy.deepcopy(template)
-
-        # Create an empty template that matches the input's track structure
-        extension_only = copy.deepcopy(template)
-        for tr in extension_only.tracks:
-            tr.notes.clear()
-
+        
         # The job router converts a bar count to tokens as bars*32; recover it.
         # Generating to a shared BAR target (not a fixed note count) keeps dense
         # and sparse tracks ending at the same musical time.
@@ -824,94 +854,109 @@ class AmadeusComposerOctuple:
                 f"Song already ends near bar {end_bar + shift} and the Bar "
                 f"vocabulary stops at {self.max_bar} — nothing can be generated")
         print(f"[Octuple] {len(prompts)} pitched tracks | prompt ends bar "
-              f"{end_bar + shift} -> generating to bar {target + shift}")
+              f"{end_bar + shift} -> generating to bar {target + shift} ({num_variations} variations)")
 
-        for i, a in prompts.items():
-            a = a.copy()
-            a[:, self.bar_idx] -= shift
-            try:
-                full = self._generate_notes(a, self.MAX_NOTES_PER_TRACK,
-                                            temperature, top_p, until_bar=target)
-            except Exception as e:
-                print(f"[Octuple] track {i}: generation failed ({e})")
-                traceback.print_exc()
-                continue
-            cont = full[len(a):]
-            if len(cont) == 0:
-                continue
-            cont = cont.copy()
-            cont[:, self.bar_idx] += shift  # back to the template's absolute frame
-            cont = cont[cont[:, self.bar_idx] - self.bar0_id <= self.max_bar]
-            if len(cont) == 0:
-                continue
+        generated_files = []
+        base_path_str = str(output_midi_path).replace(".mid", "")
 
-            try:
-                # Octuple bars are absolute, so the continuation rows alone decode
-                # at the correct musical time — no round-trip of the prompt needed,
-                # which preserves the template's tempo curves and CCs.
-                cont_score = self._decode_rows(cont)
-                if not cont_score.tracks:
+        # ─── STOCHASTIC VARIATION LOOP ───
+        # Iterates through the requested number of continuations, utilizing temperature and 
+        # nucleus sampling (top-p) to traverse divergent paths in the probability space.
+        for v_idx in range(num_variations):
+            var_suffix = f"_var{v_idx+1}" if num_variations > 1 else ""
+            
+            combined = copy.deepcopy(template)
+            # Create an empty template that matches the input's track structure
+            extension_only = copy.deepcopy(template)
+            for tr in extension_only.tracks:
+                tr.notes.clear()
+
+            for i, a in prompts.items():
+                a = a.copy()
+                a[:, self.bar_idx] -= shift
+                try:
+                    # Execute auto-regressive generation over the multi-dimensional sequence
+                    full = self._generate_notes(a, self.MAX_NOTES_PER_TRACK,
+                                                temperature, top_p, until_bar=target)
+                except Exception as e:
+                    print(f"[Octuple] track {i}: generation failed ({e})")
+                    traceback.print_exc()
+                    continue
+                cont = full[len(a):]
+                if len(cont) == 0:
+                    continue
+                cont = cont.copy()
+                cont[:, self.bar_idx] += shift  # back to the template's absolute frame
+                cont = cont[cont[:, self.bar_idx] - self.bar0_id <= self.max_bar]
+                if len(cont) == 0:
                     continue
 
-                # Synchronize tick resolutions (decoded Octuple is ~16 tpq)
-                if cont_score.tpq != combined.tpq:
-                    try: cont_score = cont_score.resample(tpq=combined.tpq)
-                    except Exception: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
+                try:
+                    # DECODING & SYMBOLIC RECONSTRUCTION
+                    # Octuple bars are absolute, so the continuation rows alone decode
+                    # at the correct musical time — no round-trip of the prompt needed,
+                    # which preserves the template's tempo curves and CCs.
+                    cont_score = self._decode_rows(cont)
+                    if not cont_score.tracks:
+                        continue
 
-                if len(cont_score.tracks) > 1:
-                    print(f"[Octuple] track {i}: decoded into {len(cont_score.tracks)} "
-                          f"tracks (Program varied mid-stream); merging all of them")
-                made = 0
-                for dtr in cont_score.tracks:
-                    for n in dtr.notes:
-                        combined.tracks[i].notes.append(n)
-                        extension_only.tracks[i].notes.append(copy.deepcopy(n))
-                        made += 1
+                    # Synchronize tick resolutions (decoded Octuple is ~16 tpq)
+                    if cont_score.tpq != combined.tpq:
+                        try: cont_score = cont_score.resample(tpq=combined.tpq)
+                        except Exception: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
 
-                # Sort events temporally so MIDI parsers do not break
-                combined.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
-                extension_only.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
-                print(f"[Octuple] track {i}: {len(a)} prompt + {made} generated notes")
-            except Exception as e:
-                print(f"Skipping track due to decode error: {e}")
+                    if len(cont_score.tracks) > 1:
+                        print(f"[Octuple] track {i}: decoded into {len(cont_score.tracks)} "
+                              f"tracks (Program varied mid-stream); merging all of them")
+                    made = 0
+                    for dtr in cont_score.tracks:
+                        for n in dtr.notes:
+                            combined.tracks[i].notes.append(n)
+                            extension_only.tracks[i].notes.append(copy.deepcopy(n))
+                            made += 1
 
-        # Loop the first drum track's pattern across the generated bars
-        if drums:
-            di = drums[0]
-            new_drums = self._loop_drum_notes(template, di, combined.tpq,
-                                              from_bar=end_bar + shift + 1,
-                                              to_bar=target + shift)
-            if new_drums:
-                for n in new_drums:
-                    combined.tracks[di].notes.append(n)
-                    extension_only.tracks[di].notes.append(copy.deepcopy(n))
-                combined.tracks[di].notes.sort(key=lambda n: getattr(n, 'time', 0))
-                extension_only.tracks[di].notes.sort(key=lambda n: getattr(n, 'time', 0))
-                print(f"[Octuple] drums: looped {len(new_drums)} notes across the extension")
+                    # Sort events temporally so MIDI parsers do not break
+                    combined.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                    extension_only.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                    print(f"[Octuple] Var {v_idx+1} track {i}: {len(a)} prompt + {made} generated notes")
+                except Exception as e:
+                    print(f"Skipping track due to decode error: {e}")
 
-        # Normalize time for the extension-only output so it starts at Time=0
-        min_time = min((n.time for tr in extension_only.tracks for n in tr.notes), default=0)
-        for tr in extension_only.tracks:
-            for n in tr.notes: n.time -= min_time
+            # Loop the first drum track's pattern across the generated bars
+            if drums:
+                di = drums[0]
+                new_drums = self._loop_drum_notes(template, di, combined.tpq,
+                                                  from_bar=end_bar + shift + 1,
+                                                  to_bar=target + shift)
+                if new_drums:
+                    for n in new_drums:
+                        combined.tracks[di].notes.append(n)
+                        extension_only.tracks[di].notes.append(copy.deepcopy(n))
+                    combined.tracks[di].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                    extension_only.tracks[di].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                    print(f"[Octuple] Var {v_idx+1} drums: looped {len(new_drums)} notes across the extension")
 
-        # Path Setup & Export
-        base_path_str = str(output_midi_path).replace(".mid", "")
-        full_path = f"{base_path_str}_full.mid"
-        ext_path = f"{base_path_str}_extension.mid"
-        wav_path = f"{base_path_str}.wav"
+            # TEMPORAL NORMALIZATION
+            # Normalize time for the extension-only output so it starts at Time=0
+            min_time = min((n.time for tr in extension_only.tracks for n in tr.notes), default=0)
+            for tr in extension_only.tracks:
+                for n in tr.notes: n.time -= min_time
 
-        combined.dump_midi(full_path)
-        extension_only.dump_midi(ext_path)
-        combined.dump_midi(str(output_midi_path))
+            # PHYSICAL FILE EXPORT & AUDIO SYNTHESIS
+            full_path = f"{base_path_str}{var_suffix}_full.mid"
+            ext_path = f"{base_path_str}{var_suffix}_extension.mid"
+            wav_path = f"{base_path_str}{var_suffix}.wav"
 
-        soundfont = SOUNDFONT_PATH
-        if os.path.exists(soundfont):
-            try:
-                subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
-            except Exception as e:
-                print(f"FluidSynth error: {e}")
+            combined.dump_midi(full_path)
+            extension_only.dump_midi(ext_path)
 
-            # Append the completed file path to the batch array
+            soundfont = SOUNDFONT_PATH
+            if os.path.exists(soundfont):
+                try:
+                    subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
+                except Exception as e:
+                    print(f"FluidSynth error: {e}")
+
             generated_files.append(f"{base_path_str}{var_suffix}.mid")
 
         return generated_files
@@ -1109,15 +1154,8 @@ class AmadeusComposerTSD:
         
         # 1. PROMPT PREPARATION
         # Extract the sequence to prime the transformer's hidden state.
-        single = copy.deepcopy(template)
-        if len(single.tracks) > 0: single.tracks = [single.tracks[0]]
-        tok_seq = self.tokenizer(single)
+        # We process tracks iteratively because TSD encodes everything into a single 1D sequence.
         
-        # Flatten the TokSequence into a 1D array of integers
-        ids = tok_seq[0].ids if isinstance(tok_seq, list) else tok_seq.ids
-        prompt = ids[-256:] 
-        if not prompt: return []
-
         generated_files = []
         base_path_str = str(output_midi_path).replace(".mid", "")
 
@@ -1132,11 +1170,23 @@ class AmadeusComposerTSD:
             for tr in extension_only.tracks:
                 tr.notes.clear()
 
-            # Execute the auto-regressive prediction loop over the causal language model
-            full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k, top_p)
-            cont_ids = full_ids[len(prompt):]
-            
-            if cont_ids:
+            for i, tr in enumerate(template.tracks):
+                if len(tr.notes) == 0: continue
+                
+                single = copy.deepcopy(template)
+                single.tracks = [tr]
+                tok_seq = self.tokenizer(single)
+                
+                # Flatten the TokSequence into a 1D array of integers
+                ids = tok_seq[0].ids if isinstance(tok_seq, list) else tok_seq.ids
+                prompt = ids[-256:] 
+                if not prompt: continue
+                
+                # Execute the auto-regressive prediction loop over the causal language model
+                full_ids = self._generate_tokens(prompt, num_generate, temperature, top_k, top_p)
+                cont_ids = full_ids[len(prompt):]
+                if not cont_ids: continue
+                
                 # 3. SEQUENCE DECODING
                 # TSD sequences require the `are_ids_encoded=True` flag to signal the 
                 # MidiTok dictionary to map the 1D integers back to categorical events
@@ -1147,25 +1197,23 @@ class AmadeusComposerTSD:
                 try:
                     # Construct a symbolic score from the sequence of categorized tokens
                     cont_score = self.tokenizer.decode([new_tok_seq])
-                    if cont_score.tracks:
-                        
-                        # Re-align temporal resolution (TPQ) to match the input framework
-                        if cont_score.tpq != combined.tpq:
-                            try: cont_score = cont_score.resample(tpq=combined.tpq)
-                            except: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
-                        
-                        # Populate the output templates with the newly generated Note objects
-                        for i, tr in enumerate(template.tracks):
-                            if len(tr.notes) == 0: continue
-                            for n in cont_score.tracks[0].notes:
-                                t, d = getattr(n, 'time', None), getattr(n, 'duration', None)
-                                if t is not None and d is not None and isinstance(t, int) and isinstance(d, int):
-                                    combined.tracks[i].notes.append(n)
-                                    extension_only.tracks[i].notes.append(copy.deepcopy(n))
-                            
-                            # Enforce chronological ordering for standard MIDI parser compliance
-                            combined.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
-                            extension_only.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                    if not cont_score.tracks: continue
+                    
+                    # Re-align temporal resolution (TPQ) to match the input framework
+                    if cont_score.tpq != combined.tpq:
+                        try: cont_score = cont_score.resample(tpq=combined.tpq)
+                        except: cont_score = _rescale_score_inplace(cont_score, combined.tpq)
+                    
+                    # Populate the output templates with the newly generated Note objects
+                    for n in cont_score.tracks[0].notes:
+                        t, d = getattr(n, 'time', None), getattr(n, 'duration', None)
+                        if t is not None and d is not None and isinstance(t, int) and isinstance(d, int):
+                            combined.tracks[i].notes.append(n)
+                            extension_only.tracks[i].notes.append(copy.deepcopy(n))
+                    
+                    # Enforce chronological ordering for standard MIDI parser compliance
+                    combined.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
+                    extension_only.tracks[i].notes.sort(key=lambda n: getattr(n, 'time', 0))
                 except Exception as e:
                     print(f"Skipping track due to decode error: {e}")
                     
@@ -1175,21 +1223,21 @@ class AmadeusComposerTSD:
             for tr in extension_only.tracks:
                 for n in tr.notes: n.time -= min_time
 
-        # Export and Render
-        base_path_str = str(output_midi_path).replace(".mid", "")
-        full_path = f"{base_path_str}_full.mid"
-        ext_path = f"{base_path_str}_extension.mid"
-        wav_path = f"{base_path_str}.wav"
-        
-        combined.dump_midi(full_path)
-        extension_only.dump_midi(ext_path)
-        
-        soundfont = SOUNDFONT_PATH
-        if os.path.exists(soundfont):
-            try:
-                subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
-            except Exception as e:
-                print(f"FluidSynth error: {e}")
+            # 5. I/O AND WAVEFORM RENDERING
+            full_path = f"{base_path_str}{var_suffix}_full.mid"
+            ext_path = f"{base_path_str}{var_suffix}_extension.mid"
+            wav_path = f"{base_path_str}{var_suffix}.wav"
+            
+            combined.dump_midi(full_path)
+            extension_only.dump_midi(ext_path)
+            
+            # Invoke the FluidSynth backend for acoustic translation
+            soundfont = SOUNDFONT_PATH
+            if os.path.exists(soundfont):
+                try:
+                    subprocess.run([FLUIDSYNTH_BIN, "-ni", "-F", wav_path, "-r", "44100", soundfont, full_path], check=True, stdout=subprocess.DEVNULL)
+                except Exception as e:
+                    print(f"FluidSynth error: {e}")
 
             generated_files.append(f"{base_path_str}{var_suffix}.mid")
 
