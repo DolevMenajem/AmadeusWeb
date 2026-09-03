@@ -176,7 +176,19 @@ export default function LiveExtend() {
   const pressedKeysRef = useRef<Set<string>>(new Set());
   const callbacksRef = useRef({ playNote: (p: number) => {}, stopNote: (p: number) => {} });
 
+  // Auto-jam engine: recording starts on the first note played and the take is
+  // sent after SILENCE_MS of no input with no keys held. Mirror refs keep the
+  // timer callbacks free of stale state (same pattern as bpmRef/callbacksRef).
+  const SILENCE_MS = 2500;
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const isRecordingRef = useRef(false);
+  const isWaitingRef = useRef(false);
+  const stopAndSendRef = useRef<() => void>(() => {});
+
   useEffect(() => { bpmRef.current = bpm[0]; }, [bpm]);
+  useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
+  useEffect(() => { isWaitingRef.current = isWaitingForAI; }, [isWaitingForAI]);
+  useEffect(() => () => { if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current); }, []);
 
   const logSystem = (msg: string) => {
     const timestamp = new Date().toISOString().split('T')[1].slice(0, 12);
@@ -200,21 +212,54 @@ export default function LiveExtend() {
     }
   };
 
+  // --- AUTO-JAM SILENCE DETECTION ---
+  const checkSilence = () => {
+    if (!isRecordingRef.current) return;
+    // A held key or an in-flight AI request postpones the send.
+    if (activeNotesMap.current.size > 0 || pressedKeysRef.current.size > 0 || isWaitingRef.current) {
+      armSilenceTimer(500);
+      return;
+    }
+    stopAndSendRef.current();
+  };
+
+  const armSilenceTimer = (ms: number = SILENCE_MS) => {
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    silenceTimerRef.current = setTimeout(checkSilence, ms);
+  };
+
   // --- PLAYBACK CONTROLS ---
   const playNote = (pitch: number) => {
     if (!instrument.current || !audioContext.current) return;
     instrument.current.play(pitch.toString(), audioContext.current.currentTime, { duration: 2 });
     setActiveKeys((prev) => [...prev, pitch]);
 
-    if (isRecording) {
+    // Auto-record: the first note played starts a new take — no Record button.
+    // The ref (not state) is read because it updates synchronously — the note
+    // that triggers the start must be captured too, before React re-renders.
+    let recording = isRecordingRef.current;
+    if (!recording) {
+      setCurrentRecording([]);
+      activeNotesMap.current.clear();
+      recordingStartTime.current = Date.now();
+      setIsRecording(true);
+      isRecordingRef.current = true;
+      recording = true;
+      logSystem(`[SYS] Auto-record started at ${bpm[0]} BPM.`);
+    }
+
+    if (recording) {
       const startTimeMs = Date.now() - recordingStartTime.current;
       activeNotesMap.current.set(pitch, startTimeMs);
     }
+    armSilenceTimer();
   };
 
   const stopNote = (pitch: number) => {
     setActiveKeys((prev) => prev.filter((p) => p !== pitch));
-    if (isRecording && activeNotesMap.current.has(pitch)) {
+    // Ref, not state: a fast tap can release before React re-renders the
+    // auto-started recording, and that first note must not be dropped.
+    if (isRecordingRef.current && activeNotesMap.current.has(pitch)) {
       const startTimeMs = activeNotesMap.current.get(pitch)!;
       const durationMs = (Date.now() - recordingStartTime.current) - startTimeMs;
       activeNotesMap.current.delete(pitch);
@@ -223,20 +268,13 @@ export default function LiveExtend() {
         ...prev,
         {
           pitch,
-          time: msToTicks(startTimeMs, bpm[0]), 
-          duration: Math.max(msToTicks(durationMs, bpm[0]), 60), 
-          velocity: 80, 
+          time: msToTicks(startTimeMs, bpm[0]),
+          duration: Math.max(msToTicks(durationMs, bpm[0]), 60),
+          velocity: 80,
         },
       ]);
     }
-  };
-
-  const startRecording = () => {
-    setCurrentRecording([]);
-    activeNotesMap.current.clear();
-    recordingStartTime.current = Date.now();
-    setIsRecording(true);
-    logSystem(`[SYS] Recording started at ${bpm[0]} BPM. Metronome: ${metronomeOn ? "ON" : "OFF"}`);
+    armSilenceTimer();
   };
 
   useEffect(() => { callbacksRef.current = { playNote, stopNote }; }, [playNote, stopNote]);
@@ -350,9 +388,12 @@ export default function LiveExtend() {
 
   // --- INFERENCE PIPELINE ---
   const stopAndSend = async () => {
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     setIsRecording(false);
-    setMetronomeOn(false);
-    
+    isRecordingRef.current = false;
+    // The metronome intentionally keeps running: in a continuous jam the shared
+    // clock must survive across turns.
+
     if (currentRecording.length === 0) {
       toast({ variant: "destructive", title: "Empty Recording", description: "You need to play some notes before sending!" });
       return;
@@ -402,6 +443,8 @@ export default function LiveExtend() {
           timestamp: new Date(),
         };
         setMessages((prev) => [...prev, aiMsg]);
+        // Auto-play the answer so the jam continues without a click.
+        playMessage(aiMsg.id, aiNotes);
       } else {
         logSystem(`[ERR] Transformer returned empty sequence.`);
         toast({ title: "AI was silent", description: "The model returned no notes." });
@@ -459,6 +502,10 @@ export default function LiveExtend() {
       setPlayingMessageId(null);
     }, (maxDurationSec + 0.5) * 1000);
   };
+
+  // Keep the silence timer pointed at the freshest closure — state inside
+  // stopAndSend would otherwise be stale when the timer fires.
+  useEffect(() => { stopAndSendRef.current = stopAndSend; });
 
   const playStitchedSession = () => {
     if (!isReady || !instrument.current || !audioContext.current) return;
@@ -701,21 +748,27 @@ export default function LiveExtend() {
                   </div>
                 </div>
 
-                {/* Primary Action Buttons */}
+                {/* Auto-Jam Status Strip: recording starts when the user plays
+                    and sends itself after a short pause — no required clicks. */}
                 <div className="flex items-center justify-between pt-2">
-                  <div className="flex gap-2">
-                    {!isRecording ? (
-                      <Button onClick={startRecording} className="w-32 gap-2 bg-red-500 hover:bg-red-600 shadow-md shadow-red-500/20 text-white transition-all">
-                        <Mic className="w-4 h-4" /> Record
-                      </Button>
-                    ) : (
-                      // VISUALS: Pulsing effect while recording
-                      <Button onClick={stopAndSend} className="w-32 gap-2 bg-primary hover:bg-primary/90 shadow-md shadow-primary/30 animate-pulse transition-all">
-                        <Square className="w-4 h-4 fill-current" /> Stop & Send
-                      </Button>
+                  <div className="flex items-center gap-2">
+                    {!isRecording && !isWaitingForAI && (
+                      <div className="flex items-center gap-2 text-muted-foreground text-sm font-semibold bg-secondary/30 px-3 py-1.5 rounded-full">
+                        <Mic className="w-4 h-4" /> Listening — just start playing
+                      </div>
+                    )}
+                    {isRecording && (
+                      <>
+                        <div className="flex items-center gap-2 text-red-500 text-sm font-semibold animate-pulse bg-red-500/10 px-3 py-1.5 rounded-full">
+                          <Mic className="w-4 h-4" /> Recording — pause to send
+                        </div>
+                        <Button size="sm" onClick={stopAndSend} className="gap-2 bg-primary hover:bg-primary/90 shadow-md shadow-primary/30 transition-all">
+                          <Square className="w-3 h-3 fill-current" /> Send now
+                        </Button>
+                      </>
                     )}
                   </div>
-                  
+
                   {isWaitingForAI && (
                     <div className="flex items-center gap-2 text-primary text-sm font-semibold animate-pulse bg-primary/10 px-3 py-1.5 rounded-full">
                       <Activity className="w-4 h-4" /> Neural inference running...
