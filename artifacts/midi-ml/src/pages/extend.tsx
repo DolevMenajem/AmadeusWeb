@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -21,31 +21,31 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Slider } from "@/components/ui/slider";
 import { JobStatusBadge } from "@/components/job-status-badge";
 import { MidiFileUpload } from "@/components/midi-file-upload";
-import { MidiVisualizer } from  "@/components/midi-visualizer";
+import { MidiVisualizer } from "@/components/midi-visualizer";
 import { InlineEdit } from "@/components/inline-edit";
 
 // Hooks & Icons
 import { useToast } from "@/hooks/use-toast";
 import { useLocalStorage } from "@/hooks/use-local-storage";
-import { Download, BrainCircuit, Sparkles, Settings2, FileMusic } from "lucide-react";
+import { Download, BrainCircuit, Sparkles, Settings2, FileMusic, Layers } from "lucide-react";
 
 // --- VALIDATION SCHEMA ---
-// Defines the strict shapes and boundaries of our form data using Zod
 const formSchema = z.object({
   barsToExtend: z.number().min(1).max(64),
   temperature: z.number().min(0.1).max(2.0),
   topK: z.number().min(0).max(100),
   topP: z.number().min(0.1).max(1.0),
   modelType: z.enum(["remi", "octuple", "tsd"]),
+  numVariations: z.number().min(1).max(3), // <-- NEW: Supports 1 to 3 variations
 });
 
 export default function Extend() {
   // --- STATE MANAGEMENT ---
-  // Using localStorage ensures the job keeps polling even if the user navigates away and comes back
   const [currentJobId, setCurrentJobId] = useLocalStorage<number | null>("amadeus_extend_job_id", null); 
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
   const [audioEl, setAudioEl] = useState<HTMLAudioElement | null>(null);
+  const [selectedVariation, setSelectedVariation] = useState<number>(1); // <-- NEW: Tracks active variation tab
   
   const { toast } = useToast();
   const queryClient = useQueryClient();
@@ -58,7 +58,7 @@ export default function Extend() {
       onSuccess: (data) => {
         toast({ title: "Job submitted", description: "Your MIDI file is being extended." });
         setCurrentJobId(data.id);
-        // Invalidate global stats so the Dashboard updates in the background
+        setSelectedVariation(1); // Reset to first variation
         queryClient.invalidateQueries({ queryKey: getListJobsQueryKey() });
         queryClient.invalidateQueries({ queryKey: getGetStatsQueryKey() });
       },
@@ -68,7 +68,6 @@ export default function Extend() {
     },
   });
 
-  // Polls the backend for job status. Stops polling automatically when not 'pending' or 'processing'
   const { data: job } = useGetJob(currentJobId as number, {
     query: {
       enabled: !!currentJobId,
@@ -90,18 +89,31 @@ export default function Extend() {
   // --- FORM INITIALIZATION ---
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
-    defaultValues: { barsToExtend: 8, temperature: 0.8, topK: 0, topP: 1.0, modelType: "remi" },
+    defaultValues: { 
+      barsToExtend: 8, 
+      temperature: 0.8, 
+      topK: 0, 
+      topP: 1.0, 
+      modelType: "remi",
+      numVariations: 1, // Default to standard single generation
+    },
   });
+
+  // Reset audio element time when switching variations
+  useEffect(() => {
+    if (audioEl) {
+      audioEl.pause();
+      audioEl.currentTime = 0;
+    }
+  }, [selectedVariation, audioEl]);
 
   // --- SUBMIT HANDLER ---
   const onSubmit = (values: z.infer<typeof formSchema>) => {
     if (!selectedFile) { setFileError("Please select a MIDI file"); return; }
     setFileError(null);
     
-    // Step 1: Upload the file
     uploadMutation.mutate({ data: { file: selectedFile } }, {
       onSuccess: (upload) => {
-        // Step 2: Trigger the ML job with the uploaded filename
         extendMutation.mutate({ 
           data: { 
             inputFilename: upload.filename, 
@@ -109,7 +121,8 @@ export default function Extend() {
             temperature: values.temperature ?? 0.8,
             topK: values.topK ?? 0,
             topP: values.topP ?? 1.0,
-            modelType: values.modelType 
+            modelType: values.modelType,
+            numVariations: values.numVariations, // <-- NEW: Dispatched to backend
           } as any 
         });
       },
@@ -120,6 +133,7 @@ export default function Extend() {
   };
 
   const isPending = uploadMutation.isPending || extendMutation.isPending;
+  const variationCount = (job as any)?.numVariations || 1;
 
   // --- RENDER ---
   return (
@@ -136,7 +150,6 @@ export default function Extend() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
         
         {/* LEFT COLUMN: Input Form */}
-        {/* VISUALS: Upgraded to a sleek gradient card with a soft shadow */}
         <Card className="bg-gradient-to-br from-card to-background/50 border-border shadow-md shadow-black/20 h-fit">
           <CardHeader>
             <CardTitle className="flex items-center gap-2"><Settings2 className="w-5 h-5 text-primary" /> Generation Settings</CardTitle>
@@ -185,8 +198,43 @@ export default function Extend() {
                   {fileError && <p className="text-sm font-medium text-destructive">{fileError}</p>}
                 </div>
 
-                {/* BLOCK 3: Generation Parameters (Sliders) */}
+                {/* BLOCK 3: Generation Parameters (Sliders & Options) */}
                 <div className="space-y-5 p-4 bg-secondary/5 border border-border rounded-lg">
+                  
+                  {/* Variations Selector */}
+                  <FormField control={form.control} name="numVariations" render={({ field }) => (
+                    <FormItem className="group border-b border-border/50 pb-4">
+                      <FormLabel className="flex justify-between items-center">
+                        <span className="font-medium group-hover:text-primary transition-colors flex items-center gap-2">
+                          <Layers className="w-4 h-4 text-primary" /> Variations to Generate
+                        </span>
+                        <span className="text-primary font-mono bg-primary/10 px-2 py-0.5 rounded text-xs">
+                          {field.value === 1 ? "1 Option (Standard)" : `${field.value} Options (Multi-Choice)`}
+                        </span>
+                      </FormLabel>
+                      <FormControl>
+                        <div className="grid grid-cols-3 gap-2 pt-1">
+                          {[1, 2, 3].map((num) => (
+                            <Button
+                              type="button"
+                              key={num}
+                              variant={field.value === num ? "default" : "outline"}
+                              size="sm"
+                              className={`text-xs h-8 ${field.value === num ? "shadow-sm shadow-primary/20" : ""}`}
+                              onClick={() => field.onChange(num)}
+                            >
+                              {num === 1 ? "Single" : `${num} Choices`}
+                            </Button>
+                          ))}
+                        </div>
+                      </FormControl>
+                      <p className="text-[10px] text-muted-foreground mt-1">
+                        Generates alternative stochastic branches so you can compare continuations.
+                      </p>
+                      <FormMessage />
+                    </FormItem>
+                  )} />
+
                   <FormField control={form.control} name="barsToExtend" render={({ field }) => (
                     <FormItem className="group">
                       <FormLabel className="flex justify-between">
@@ -331,25 +379,58 @@ export default function Extend() {
                   {job.status === "completed" && (
                     <div className="space-y-6 pt-2 animate-in fade-in slide-in-from-bottom-2 duration-700">
                       
+                      {/* VARIATION SWITCHER TABS (Only shown if job generated > 1 option) */}
+                      {variationCount > 1 && (
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+                            <span className="flex items-center gap-1.5"><Layers className="w-3.5 h-3.5 text-primary" /> Generated Variations</span>
+                            <span className="text-primary font-mono">Option {selectedVariation} of {variationCount}</span>
+                          </div>
+                          <div className="grid grid-cols-3 gap-2 bg-secondary/20 p-1.5 rounded-lg border border-border/50">
+                            {Array.from({ length: variationCount }).map((_, idx) => {
+                              const varNum = idx + 1;
+                              const isActive = selectedVariation === varNum;
+                              return (
+                                <Button
+                                  key={varNum}
+                                  type="button"
+                                  variant={isActive ? "default" : "ghost"}
+                                  size="sm"
+                                  className={`h-8 text-xs font-medium transition-all ${
+                                    isActive ? "shadow-sm shadow-primary/20" : "text-muted-foreground hover:text-foreground"
+                                  }`}
+                                  onClick={() => setSelectedVariation(varNum)}
+                                >
+                                  Option {varNum}
+                                </Button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
                       {/* Audio Player & Visualizer */}
                       <div className="space-y-4 bg-secondary/20 p-5 rounded-lg border border-border shadow-inner">
                         <h4 className="text-sm font-semibold flex items-center justify-center gap-2">
-                          <BrainCircuit className="w-4 h-4 text-primary" /> AI Studio Render
+                          <BrainCircuit className="w-4 h-4 text-primary" /> 
+                          AI Studio Render {variationCount > 1 ? `(Option ${selectedVariation})` : ""}
                         </h4>
 
                         <div className="mb-2 ring-1 ring-border rounded-lg overflow-hidden bg-black/20">
                           <MidiVisualizer 
-                            midiUrl={`/api/jobs/${job.id}/download?type=full`} 
+                            key={`vis-${job.id}-${selectedVariation}`} // Re-mount visualizer when switching options
+                            midiUrl={`/api/jobs/${job.id}/download?type=full&variation=${selectedVariation}`} 
                             inputMidiUrl={`/api/jobs/${job.id}/download?type=input`}
                             audioElement={audioEl} 
                           />
                         </div>
 
                         <audio 
+                          key={`audio-${job.id}-${selectedVariation}`} // Re-mount audio element when switching options
                           ref={setAudioEl}
                           controls 
                           className="w-full h-10 rounded-md shadow-sm" 
-                          src={`/api/jobs/${job.id}/download?type=audio`}
+                          src={`/api/jobs/${job.id}/download?type=audio&variation=${selectedVariation}`}
                           controlsList="nodownload"
                         >
                           Your browser does not support the audio element.
@@ -359,12 +440,12 @@ export default function Extend() {
                       {/* Download Actions */}
                       <div className="grid grid-cols-2 gap-3 pt-2">
                         <Button asChild variant="default" className="w-full gap-2 shadow-sm shadow-primary/20 hover:shadow-primary/40">
-                          <a href={`/api/jobs/${job.id}/download?type=full`} download>
-                            <Download className="w-4 h-4" /> Full Song
+                          <a href={`/api/jobs/${job.id}/download?type=full&variation=${selectedVariation}`} download>
+                            <Download className="w-4 h-4" /> Full Song {variationCount > 1 ? `(Opt ${selectedVariation})` : ""}
                           </a>
                         </Button>
                         <Button asChild variant="outline" className="w-full gap-2 hover:bg-primary/5 hover:text-primary">
-                          <a href={`/api/jobs/${job.id}/download?type=extension`} download>
+                          <a href={`/api/jobs/${job.id}/download?type=extension&variation=${selectedVariation}`} download>
                             <Download className="w-4 h-4" /> Extension Only
                           </a>
                         </Button>

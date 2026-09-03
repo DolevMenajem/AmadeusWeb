@@ -55,7 +55,6 @@ GENRE_LABELS = {
 
 
 def serialize_job(row: dict) -> dict:
-    # Helper to safely format dates whether they are strings (SQLite) or datetime objects (Postgres)
     def safe_iso(date_val):
         if not date_val:
             return None
@@ -63,12 +62,26 @@ def serialize_job(row: dict) -> dict:
             return date_val
         return date_val.isoformat()
 
+    # Parse output_filename whether it's a JSON array or a plain string
+    output_raw = row.get("output_filename")
+    variations = []
+    primary_output = output_raw
+
+    if output_raw and output_raw.startswith("["):
+        try:
+            variations = json.loads(output_raw)
+            primary_output = variations[0] if variations else output_raw
+        except Exception:
+            variations = []
+
     return {
         "id": row["id"],
         "type": row["type"],
         "status": row["status"],
         "inputFilename": row["input_filename"],
-        "outputFilename": row["output_filename"],
+        "outputFilename": primary_output,
+        "variations": variations, # List of filenames if multi-choice
+        "numVariations": len(variations) if variations else 1,
         "targetGenre": row["target_genre"],
         "barsToExtend": row["bars_to_extend"],
         "evaluationResult": json.loads(row["evaluation_result"]) if row.get("evaluation_result") else None,
@@ -76,7 +89,6 @@ def serialize_job(row: dict) -> dict:
         "createdAt": safe_iso(row.get("created_at")),
         "completedAt": safe_iso(row.get("completed_at")),
     }
-
 
 def _set_status(job_id: int, status: str):
     with get_conn() as conn:
@@ -104,7 +116,7 @@ def _fail_job(job_id: int, message: str):
 # Added model_type to the processing arguments
 async def simulate_processing(job_id: int, job_type: str, target_genre: str | None = None, bars: int | None = None,
                              input_filename: str | None = None, temperature: float = 0.8, top_k: int = 0, top_p: float = 1.0,
-                             model_type: str = "remi"):
+                             model_type: str = "remi", num_variations=1):
     await asyncio.sleep(0.5)
     
     try:
@@ -171,7 +183,6 @@ async def simulate_processing(job_id: int, job_type: str, target_genre: str | No
                 
                 tokens_to_generate = (bars or 4) * 32
                 
-                # --- DYNAMIC ROUTING ---
                 if model_type == "octuple":
                     active_composer = composer_octuple
                 elif model_type == "tsd":
@@ -180,7 +191,8 @@ async def simulate_processing(job_id: int, job_type: str, target_genre: str | No
                     active_composer = composer_remi
                 
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
+                # Run engine with num_variations
+                generated_paths = await loop.run_in_executor(
                     None,
                     lambda: active_composer.extend_midi(
                         input_midi_path=input_path,
@@ -188,16 +200,26 @@ async def simulate_processing(job_id: int, job_type: str, target_genre: str | No
                         num_generate=tokens_to_generate,
                         temperature=temperature,
                         top_k=top_k,
-                        top_p=top_p
+                        top_p=top_p,
+                        num_variations=num_variations
                     )
                 )
+                
+                # If multiple variations were generated, store JSON; otherwise, store the single filename
+                if isinstance(generated_paths, list):
+                    if len(generated_paths) > 1:
+                        stored_output = json.dumps([os.path.basename(p) for p in generated_paths])
+                    else:
+                        stored_output = os.path.basename(generated_paths[0])
+                else:
+                    stored_output = output_filename
             else:
-                output_filename = generate_output_midi(job_id, job_type, target_genre, bars)
+                stored_output = generate_output_midi(job_id, job_type, target_genre, bars)
 
             _complete_job(job_id, {
                 "status": "completed",
                 "completed_at": datetime.now(timezone.utc),
-                "output_filename": output_filename,
+                "output_filename": stored_output,
             })
 
     except asyncio.CancelledError:
@@ -242,7 +264,8 @@ class ExtendInput(BaseModel):
     temperature: float = Field(default=0.8)
     topK: int = Field(default=0)
     topP: float = Field(default=1.0)
-    modelType: str = Field(default="remi") # NEW: Tracks the selected model
+    modelType: str = Field(default="remi")
+    numVariations: int = Field(default=1, ge=1, le=3) # Allow between 1 and 3 options
 
 @router.post("/jobs/extend", status_code=201)
 async def extend_midi(body: ExtendInput):
@@ -255,7 +278,8 @@ async def extend_midi(body: ExtendInput):
             row = cur.fetchone()
     task = asyncio.create_task(simulate_processing(
         row["id"], "extend", bars=body.barsToExtend, input_filename=body.inputFilename, 
-        temperature=body.temperature, top_k=body.topK, top_p=body.topP, model_type=body.modelType
+        temperature=body.temperature, top_k=body.topK, top_p=body.topP, model_type=body.modelType,
+        num_variations=body.numVariations # Pass to worker
     ))
     RUNNING_TASKS[row["id"]] = task
     task.add_done_callback(lambda t, jid=row["id"]: RUNNING_TASKS.pop(jid, None))
@@ -371,7 +395,7 @@ async def export_jam_midi(body: JamRequest):
 
 # ── GET /jobs/:id/download ────────────────────────────────────────────────────
 @router.get("/jobs/{job_id}/download")
-def download_job_result(job_id: int, type: str = "full"):
+def download_job_result(job_id: int, type: str = "full", variation: int = 1):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM jobs WHERE id = %s", (job_id,))
@@ -380,17 +404,33 @@ def download_job_result(job_id: int, type: str = "full"):
     if not row or row["status"] != "completed" or not row["output_filename"]:
         raise HTTPException(status_code=404, detail="Job result not found")
 
-    base_name = row["output_filename"].replace(".mid", "")
+    output_raw = row["output_filename"]
     
-    # Route the request to the correct generated file
+    # Resolve target variation filename if stored as a list
+    if output_raw.startswith("["):
+        try:
+            var_list = json.loads(output_raw)
+            idx = max(0, min(variation - 1, len(var_list) - 1))
+            target_filename = var_list[idx]
+        except Exception:
+            target_filename = f"amadeus_creation_{job_id}.mid"
+    else:
+        # Backward compatibility for single jobs or when variation > 1 is requested on a multi-var run
+        if variation > 1:
+            target_filename = f"amadeus_creation_{job_id}_var{variation}.mid"
+        else:
+            target_filename = output_raw
+
+    base_name = target_filename.replace(".mid", "")
+    
     if type == "extension":
         file_name = f"{base_name}_extension.mid"
         media_type = "audio/midi"
-        download_name = f"extension_{row['output_filename']}"
+        download_name = f"extension_{target_filename}"
     elif type == "audio":
         file_name = f"{base_name}.wav"
         media_type = "audio/wav"
-        download_name = row["output_filename"].replace(".mid", ".wav")
+        download_name = target_filename.replace(".mid", ".wav")
     elif type == "input":
         file_name = row["input_filename"]
         media_type = "audio/midi"
@@ -398,14 +438,14 @@ def download_job_result(job_id: int, type: str = "full"):
     else: # full
         file_name = f"{base_name}_full.mid"
         media_type = "audio/midi"
-        download_name = f"full_{row['output_filename']}"
+        download_name = f"full_{target_filename}"
 
     file_path = Path(UPLOADS_DIR) / file_name
     
-    # Fallback just in case an older job only has the base .mid file
+    # Fallback to base .mid file if specific artifact is missing
     if not file_path.exists():
-        file_path = Path(UPLOADS_DIR) / row["output_filename"]
-        download_name = row["output_filename"]
+        file_path = Path(UPLOADS_DIR) / target_filename
+        download_name = target_filename
         media_type = "audio/midi"
         
     if not file_path.exists():
